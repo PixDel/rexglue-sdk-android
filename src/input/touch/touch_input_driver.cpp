@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <cstring>
@@ -40,7 +41,7 @@ REXCVAR_DEFINE_STRING(touch_portal_chord, "guide", "Input",
 
 namespace rex::input::touch {
 
-namespace {
+inline namespace touch_detail {
 
 constexpr DeviceId kTouchDevice = static_cast<DeviceId>(0x544F5543);  // "TOUC"
 using Clock = std::chrono::steady_clock;
@@ -110,8 +111,18 @@ State& Shared() {
   return state;
 }
 
+// SDL_HasGamepad takes SDL's joystick lock; asked many times a second, so cached for 500 ms.
 bool GamepadConnected() {
-  return SDL_HasGamepad();
+  static std::atomic<int64_t> next_check_ms{0};
+  static std::atomic<bool> connected{false};
+  const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             Clock::now().time_since_epoch())
+                             .count();
+  if (now_ms >= next_check_ms.load(std::memory_order_relaxed)) {
+    next_check_ms.store(now_ms + 500, std::memory_order_relaxed);
+    connected.store(SDL_HasGamepad(), std::memory_order_relaxed);
+  }
+  return connected.load(std::memory_order_relaxed);
 }
 
 // Whether the controls take touches and are drawn (the eye button aside).
@@ -307,9 +318,16 @@ X_RESULT TouchInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state)
     REXLOG_DEBUG("Touch: buttons {:04X}", buttons);
     last_logged_buttons_ = buttons;
   }
+  // Like a real pad, the packet number moves only when the state changes.
+  const uint64_t signature = uint64_t(buttons) | (uint64_t(lt) << 16) | (uint64_t(rt) << 24) |
+                             (uint64_t(uint16_t(lx)) << 32) | (uint64_t(uint16_t(ly)) << 48);
+  if (signature != last_signature_) {
+    last_signature_ = signature;
+    ++packet_number_;
+  }
   if (out_state) {
     std::memset(out_state, 0, sizeof(*out_state));
-    out_state->packet_number = ++packet_number_;
+    out_state->packet_number = packet_number_;
     out_state->gamepad.buttons = buttons;
     out_state->gamepad.left_trigger = lt;
     out_state->gamepad.right_trigger = rt;
@@ -335,13 +353,9 @@ void TouchInputDriver::OnTouchEvent(rex::ui::TouchEvent& e) {
   State& s = Shared();
   std::lock_guard lock(s.mutex);
   if (s.width <= 0) return;  // not drawn yet
-  // Touches come in physical pixels; the layout is in ImGui's logical units (as ImGuiDrawer
-  // converts the mouse: medium DPI / DPI).
-  float to_logical = 1.0f;
-  if (rex::ui::Window* w = e.target(); w && w->GetDpi() > 0) {
-    to_logical = float(w->GetMediumDpi()) / float(w->GetDpi());
-  }
-  const float x = e.x() * to_logical, y = e.y() * to_logical;
+  // Touches and the layout are both in the window's physical pixels (the layout comes from the
+  // Android overlay view's size, see nativeSetViewSize).
+  const float x = e.x(), y = e.y();
   const uint32_t id = e.pointer_id();
   using Action = rex::ui::TouchEvent::Action;
 
@@ -477,3 +491,56 @@ void TouchControlsDialog::OnDraw(ImGuiIO& io) {
 }
 
 }  // namespace rex::input::touch
+
+#if REX_PLATFORM_ANDROID
+#include <jni.h>
+
+// The on-screen controls are drawn by an Android View over the game (TouchOverlayView), not with
+// ImGui: an ImGui drawer forces the presenter to paint every guest frame from the UI thread,
+// which halved the frame rate. The View tells its size here and polls the state to draw.
+extern "C" JNIEXPORT void JNICALL Java_de_pixdel_ssarecomp_TouchOverlayView_nativeSetViewSize(
+    JNIEnv*, jclass, jint width, jint height) {
+  using namespace rex::input::touch;
+  State& s = Shared();
+  std::lock_guard lock(s.mutex);
+  UpdateLayout(s, float(width), float(height));
+}
+
+// out: [0] flags (1 eye visible, 2 controls visible, 4 hidden by user, 8 stick active),
+// [1] held control bits, [2] opacity, [3..6] stick base x, y, knob x, y, [7] stick radius,
+// then x, y, r for each control (kControlCount of them).
+extern "C" JNIEXPORT jint JNICALL Java_de_pixdel_ssarecomp_TouchOverlayView_nativeGetState(
+    JNIEnv* env, jclass, jfloatArray out) {
+  using namespace rex::input::touch;
+  State& s = Shared();
+  float buf[8 + 3 * kControlCount] = {};
+  {
+    std::lock_guard lock(s.mutex);
+    uint32_t flags = 0;
+    if (s.width > 0 && EyeVisible()) flags |= 1;
+    if (s.width > 0 && ControlsVisible(s)) flags |= 2;
+    if (s.hidden_by_user) flags |= 4;
+    if (s.stick_active) flags |= 8;
+    uint32_t held = 0;
+    for (int c = 0; c < kControlCount; ++c) {
+      if (ControlHeld(s, c)) held |= 1u << c;
+    }
+    buf[0] = float(flags);
+    buf[1] = float(held);
+    buf[2] = float(REXCVAR_GET(touch_controls_opacity));
+    buf[3] = s.stick_base_x;
+    buf[4] = s.stick_base_y;
+    buf[5] = s.stick_x;
+    buf[6] = s.stick_y;
+    buf[7] = s.stick_radius;
+    for (int c = 0; c < kControlCount; ++c) {
+      buf[8 + 3 * c] = s.layout[c].x;
+      buf[9 + 3 * c] = s.layout[c].y;
+      buf[10 + 3 * c] = s.layout[c].r;
+    }
+  }
+  const jsize n = std::min<jsize>(env->GetArrayLength(out), jsize(sizeof(buf) / sizeof(buf[0])));
+  env->SetFloatArrayRegion(out, 0, n, buf);
+  return jint(kControlCount);
+}
+#endif

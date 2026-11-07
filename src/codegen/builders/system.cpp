@@ -55,8 +55,10 @@ bool build_db16cyc(BuilderContext& ctx) {
 }
 
 bool build_cctpl(BuilderContext& ctx) {
-  // Xenon-specific cache control thread priority low, no effect in recompiled code
-  (void)ctx;
+  // Xenon "thread priority low": games lower it around spin-wait delays (db16cyc runs) so the
+  // sibling hardware thread gets the core. Recompiled, those waits spin a whole host core at full
+  // speed; REX_SPIN_PAUSE backs off (and sleeps briefly when a thread keeps spinning).
+  ctx.println("\tREX_SPIN_PAUSE();");
   return true;
 }
 

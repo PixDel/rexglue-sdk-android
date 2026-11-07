@@ -4984,6 +4984,7 @@ namespace {
 // Submission statistics (vulkan_submission_stats): logged every 2 seconds.
 struct SubmissionStats {
   uint64_t submits = 0, submit_ns = 0, waits = 0, wait_ns = 0, polls = 0, poll_ns = 0;
+  uint64_t gpu_ns = 0, gpu_samples = 0;
   std::chrono::steady_clock::time_point last_log = std::chrono::steady_clock::now();
 };
 SubmissionStats g_submission_stats;
@@ -5000,12 +5001,23 @@ void MaybeLogSubmissionStats() {
   if (seconds < 2.0) return;
   REXGPU_INFO(
       "Submission stats per second: {:.0f} submits ({:.2f} ms), {:.0f} blocking fence waits "
-      "({:.2f} ms), {:.0f} fence polls ({:.2f} ms)",
+      "({:.2f} ms), {:.0f} fence polls ({:.2f} ms), GPU busy {:.1f} ms ({:.0f} timed)",
       st.submits / seconds, st.submit_ns / 1e6 / seconds, st.waits / seconds,
-      st.wait_ns / 1e6 / seconds, st.polls / seconds, st.poll_ns / 1e6 / seconds);
+      st.wait_ns / 1e6 / seconds, st.polls / seconds, st.poll_ns / 1e6 / seconds,
+      st.gpu_ns / 1e6 / seconds, st.gpu_samples / seconds);
   st = SubmissionStats();
   st.last_log = now;
 }
+}  // namespace
+
+
+namespace {
+// GPU time per submission (vulkan_submission_stats): a timestamp at the start and the end of each
+// command buffer, read once its fence has signaled.
+constexpr uint32_t kGpuTimerSlots = 256;
+VkQueryPool g_gpu_timer_pool = VK_NULL_HANDLE;
+double g_gpu_timer_period_ns = 1.0;
+bool g_gpu_timer_written[kGpuTimerSlots] = {};
 }  // namespace
 
 void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_submission) {
@@ -5115,6 +5127,18 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
     const auto& command_buffer_pair = command_buffers_submitted_.front();
     if (command_buffer_pair.first > submission_completed_) {
       break;
+    }
+    const uint32_t timer_slot = uint32_t(command_buffer_pair.first % kGpuTimerSlots);
+    if (g_gpu_timer_pool != VK_NULL_HANDLE && g_gpu_timer_written[timer_slot]) {
+      g_gpu_timer_written[timer_slot] = false;
+      uint64_t stamps[2] = {};
+      if (dfn.vkGetQueryPoolResults(device, g_gpu_timer_pool, 2 * timer_slot, 2, sizeof(stamps),
+                                    stamps, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) ==
+              VK_SUCCESS &&
+          stamps[1] > stamps[0]) {
+        g_submission_stats.gpu_ns += uint64_t(double(stamps[1] - stamps[0]) * g_gpu_timer_period_ns);
+        ++g_submission_stats.gpu_samples;
+      }
     }
     command_buffers_writable_.push_back(command_buffer_pair.second);
     command_buffers_submitted_.pop_front();
@@ -5469,7 +5493,30 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       REXGPU_ERROR("Failed to begin a Vulkan command buffer");
       return false;
     }
+    const bool time_gpu = REXCVAR_GET(vulkan_submission_stats);
+    const uint32_t timer_slot = uint32_t(GetCurrentSubmission() % kGpuTimerSlots);
+    if (time_gpu && g_gpu_timer_pool == VK_NULL_HANDLE) {
+      VkQueryPoolCreateInfo pool_info = {};
+      pool_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+      pool_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+      pool_info.queryCount = 2 * kGpuTimerSlots;
+      dfn.vkCreateQueryPool(device, &pool_info, nullptr, &g_gpu_timer_pool);
+      VkPhysicalDeviceProperties props;
+      vulkan_device->vulkan_instance()->functions().vkGetPhysicalDeviceProperties(
+          vulkan_device->physical_device(), &props);
+      g_gpu_timer_period_ns = props.limits.timestampPeriod;
+    }
+    if (time_gpu && g_gpu_timer_pool != VK_NULL_HANDLE) {
+      dfn.vkCmdResetQueryPool(command_buffer.buffer, g_gpu_timer_pool, 2 * timer_slot, 2);
+      dfn.vkCmdWriteTimestamp(command_buffer.buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                              g_gpu_timer_pool, 2 * timer_slot);
+    }
     deferred_command_buffer_.Execute(command_buffer.buffer);
+    if (time_gpu && g_gpu_timer_pool != VK_NULL_HANDLE) {
+      dfn.vkCmdWriteTimestamp(command_buffer.buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                              g_gpu_timer_pool, 2 * timer_slot + 1);
+      g_gpu_timer_written[timer_slot] = true;
+    }
     if (dfn.vkEndCommandBuffer(command_buffer.buffer) != VK_SUCCESS) {
       REXGPU_ERROR("Failed to end a Vulkan command buffer");
       return false;

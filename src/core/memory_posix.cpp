@@ -16,6 +16,8 @@
 #include <fstream>
 #include <functional>
 #include <string>
+#include <mutex>
+#include <map>
 
 #include <fcntl.h>
 
@@ -240,6 +242,63 @@ static PageAccess PermsToPageAccess(const char perms[5]) {
 }  // namespace
 #endif  // REX_PLATFORM_LINUX
 
+#if REX_PLATFORM_LINUX
+// The protection of every range this module maps or protects, so QueryProtect (and Protect's old
+// access) don't have to read and parse /proc/self/maps: that took ~20 % of a game thread whose
+// GPU write watches fault often (MMIOHandler rechecks the page's protection on every fault).
+// Ranges mapped elsewhere aren't in it and still go through /proc/self/maps.
+namespace {
+class ProtectionShadow {
+ public:
+  void Assign(uintptr_t start, uintptr_t end, PageAccess access) { Update(start, end, &access); }
+  void Erase(uintptr_t start, uintptr_t end) { Update(start, end, nullptr); }
+  bool Lookup(uintptr_t address, uintptr_t& end_out, PageAccess& access_out) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = ranges_.upper_bound(address);
+    if (it == ranges_.begin()) return false;
+    --it;
+    if (address >= it->second.end) return false;
+    end_out = it->second.end;
+    access_out = it->second.access;
+    return true;
+  }
+
+ private:
+  struct Range {
+    uintptr_t end;
+    PageAccess access;
+  };
+  void Split(uintptr_t at) {
+    auto it = ranges_.upper_bound(at);
+    if (it == ranges_.begin()) return;
+    --it;
+    if (it->first < at && it->second.end > at) {
+      const Range tail = it->second;
+      it->second.end = at;
+      ranges_[at] = tail;
+    }
+  }
+  void Update(uintptr_t start, uintptr_t end, const PageAccess* access) {
+    if (start >= end) return;
+    std::lock_guard<std::mutex> lock(mutex_);
+    Split(start);
+    Split(end);
+    for (auto it = ranges_.lower_bound(start); it != ranges_.end() && it->first < end;) {
+      it = ranges_.erase(it);
+    }
+    if (access) ranges_[start] = Range{end, *access};
+  }
+  std::mutex mutex_;
+  std::map<uintptr_t, Range> ranges_;
+};
+ProtectionShadow& Shadow() {
+  static ProtectionShadow shadow;
+  return shadow;
+}
+inline uintptr_t U(void* p) { return reinterpret_cast<uintptr_t>(p); }
+}  // namespace
+#endif
+
 void* AllocFixed(void* base_address, size_t length, AllocationType allocation_type,
                  PageAccess access) {
   // Emulates Windows VirtualAlloc behavior:
@@ -299,6 +358,10 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
 
   void* result = mmap(base_address, length, prot_initial, flags, -1, 0);
   if (result != MAP_FAILED) {
+#if REX_PLATFORM_LINUX
+    Shadow().Assign(U(result), U(result) + length,
+                    prot_initial == PROT_NONE ? PageAccess::kNoAccess : access);
+#endif
     return result;
   }
 #if defined(MAP_FIXED_NOREPLACE) && REX_PLATFORM_LINUX
@@ -310,6 +373,7 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
     // Verify the entire range is mapped before using mprotect
     if (IsRangeFullyMapped(base_address, length)) {
       if (mprotect(base_address, length, static_cast<int>(prot_requested)) == 0) {
+        Shadow().Assign(U(base_address), U(base_address) + length, access);
         return base_address;
       }
     }
@@ -326,13 +390,20 @@ bool DeallocFixed(void* base_address, size_t length, DeallocationType deallocati
       if (mprotect(base_address, length, PROT_NONE) != 0) {
         return false;
       }
+#if REX_PLATFORM_LINUX
+      Shadow().Assign(U(base_address), U(base_address) + length, PageAccess::kNoAccess);
+#endif
 #if defined(MADV_DONTNEED)
       (void)madvise(base_address, length, MADV_DONTNEED);
 #endif
       return true;
     }
     case DeallocationType::kRelease: {
-      return munmap(base_address, length) == 0;
+      const bool released = munmap(base_address, length) == 0;
+#if REX_PLATFORM_LINUX
+      if (released) Shadow().Erase(U(base_address), U(base_address) + length);
+#endif
+      return released;
     }
     default:
       // how we get here? :(
@@ -360,15 +431,21 @@ bool Protect(void* base_address, size_t length, PageAccess access, PageAccess* o
   //             atomic in a mutli-threaded process either, but it's something to be aware of.
   // Query old access before changing, if the caller needs it
   if (out_old_access) {
-    LinuxMapEntry e;
-    if (FindEntryForAddress(base_address, e)) {
-      *out_old_access = PermsToPageAccess(e.perms);
+    uintptr_t shadow_end;
+    if (!Shadow().Lookup(U(base_address), shadow_end, *out_old_access)) {
+      LinuxMapEntry e;
+      if (FindEntryForAddress(base_address, e)) {
+        *out_old_access = PermsToPageAccess(e.perms);
+      }
     }
   }
 #endif
 
   uint32_t prot = ToPosixProtectFlags(access);
   int ret = mprotect(base_address, length, prot);
+#if REX_PLATFORM_LINUX
+  if (ret == 0) Shadow().Assign(U(base_address), U(base_address) + length, access);
+#endif
   if (ret != 0) {
     REXSYS_ERROR("mprotect({}, 0x{:X}, {}) failed: {} ({})", base_address, length, prot,
                  strerror(errno), errno);
@@ -418,6 +495,12 @@ bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
 #else
   access_out = PageAccess::kNoAccess;
   length = 0;
+
+  uintptr_t shadow_end;
+  if (Shadow().Lookup(U(base_address), shadow_end, access_out)) {
+    length = static_cast<size_t>(shadow_end - U(base_address));
+    return true;
+  }
 
   LinuxMapEntry e;
   if (!FindEntryForAddress(base_address, e)) {
@@ -527,12 +610,19 @@ void* MapFileView(FileMappingHandle handle, void* base_address, size_t length, P
     munmap(result, length);
     return nullptr;
   }
+#if REX_PLATFORM_LINUX
+  Shadow().Assign(U(result), U(result) + length, access);
+#endif
 
   return result;
 }
 
 bool UnmapFileView(FileMappingHandle handle, void* base_address, size_t length) {
-  return munmap(base_address, length) == 0;
+  const bool unmapped = munmap(base_address, length) == 0;
+#if REX_PLATFORM_LINUX
+  if (unmapped) Shadow().Erase(U(base_address), U(base_address) + length);
+#endif
+  return unmapped;
 }
 
 }  // namespace memory

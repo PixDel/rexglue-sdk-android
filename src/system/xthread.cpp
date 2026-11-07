@@ -997,6 +997,8 @@ uint32_t XThread::SelfSuspend() {
 }
 #endif
 
+void RecordGuestWait(const char* kind, int64_t requested_ms, uint64_t taken_ns, bool timed_out);
+
 X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t interval) {
   int64_t timeout_ticks = interval;
   uint32_t timeout_ms;
@@ -1013,6 +1015,17 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t in
   }
   timeout_ms = chrono::Clock::ScaleGuestDurationMillis(timeout_ms);
   CheckTitleTermination();
+  struct DelayRecord {
+    uint32_t ms;
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    ~DelayRecord() {
+      RecordGuestWait("Delay", int64_t(ms),
+                      uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now() - start)
+                                   .count()),
+                      false);
+    }
+  } delay_record{timeout_ms};
   if (alertable) {
     auto result = rex::thread::AlertableSleep(std::chrono::milliseconds(timeout_ms));
     CheckTitleTermination();

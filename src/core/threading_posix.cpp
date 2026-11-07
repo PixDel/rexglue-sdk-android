@@ -34,9 +34,13 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 #include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
+#if REX_PLATFORM_LINUX
+#include <sys/prctl.h>
+#endif
 
 #include <rex/assert.h>
 #include <rex/chrono/chrono_steady_cast.h>
+#include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/thread/timer_queue.h>
 
@@ -63,6 +67,60 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 #endif
 
 namespace rex::thread {
+
+#if REX_PLATFORM_ANDROID
+// Phones have one or two fast cores. The game's main thread is its frame's critical path, while
+// some guest threads (a job queue worker) spin idle on whatever core they get - often the fastest.
+// Threads named in android_prime_core_threads run on the fastest core(s); the ones in
+// android_off_prime_threads on every other core.
+REXCVAR_DEFINE_STRING(android_prime_core_threads, "Game Master", "Kernel",
+                      "Android: comma-separated thread name prefixes to run on the fastest core");
+REXCVAR_DEFINE_STRING(android_off_prime_threads, "JQ Worker", "Kernel",
+                      "Android: comma-separated thread name prefixes to keep off the fastest core");
+
+namespace {
+bool NameMatches(const std::string& name, const std::string& list) {
+  size_t start = 0;
+  while (start < list.size()) {
+    size_t comma = list.find(',', start);
+    std::string prefix = list.substr(start, comma == std::string::npos ? std::string::npos
+                                                                         : comma - start);
+    while (!prefix.empty() && prefix.front() == ' ') prefix.erase(prefix.begin());
+    while (!prefix.empty() && prefix.back() == ' ') prefix.pop_back();
+    if (!prefix.empty() && name.compare(0, prefix.size(), prefix) == 0) return true;
+    if (comma == std::string::npos) break;
+    start = comma + 1;
+  }
+  return false;
+}
+
+// CPUs whose maximum frequency is the highest of the device.
+uint64_t PrimeCoreMask() {
+  static const uint64_t mask = [] {
+    uint64_t best_freq = 0, result = 0;
+    for (int cpu = 0; cpu < 64; ++cpu) {
+      char path[96];
+      snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", cpu);
+      FILE* f = fopen(path, "r");
+      if (!f) continue;
+      unsigned long long freq = 0;
+      if (fscanf(f, "%llu", &freq) == 1) {
+        if (freq > best_freq) {
+          best_freq = freq;
+          result = 0;
+        }
+        if (freq == best_freq) result |= uint64_t(1) << cpu;
+      }
+      fclose(f);
+    }
+    return result;
+  }();
+  return mask;
+}
+
+}  // namespace
+#endif
+
 
 #if REX_PLATFORM_ANDROID
 // May be null if no dynamically loaded functions are required.
@@ -1400,6 +1458,9 @@ class PosixThread : public PosixConditionHandle<Thread> {
   void set_name(std::string name) override {
     handle_.WaitStarted();
     Thread::set_name(name);
+#if REX_PLATFORM_ANDROID
+    ApplyAndroidThreadPlacement(name);
+#endif
     if (name.length() > 15) {
       name = name.substr(0, 15);
     }
@@ -1410,6 +1471,26 @@ class PosixThread : public PosixConditionHandle<Thread> {
 
   uint64_t affinity_mask() override { return handle_.affinity_mask(); }
   void set_affinity_mask(uint64_t mask) override { handle_.set_affinity_mask(mask); }
+
+#if REX_PLATFORM_ANDROID
+  void ApplyAndroidThreadPlacement(const std::string& name) {
+    const uint64_t prime = PrimeCoreMask();
+    if (!prime) return;
+    const int cpu_count = int(sysconf(_SC_NPROCESSORS_CONF));
+    const uint64_t all = cpu_count >= 64 ? ~uint64_t(0) : (uint64_t(1) << cpu_count) - 1;
+    if (prime == all) return;  // all cores alike: nothing to separate
+    uint64_t mask = 0;
+    if (NameMatches(name, REXCVAR_GET(android_prime_core_threads))) {
+      mask = prime;
+    } else if (NameMatches(name, REXCVAR_GET(android_off_prime_threads))) {
+      mask = all & ~prime;
+    }
+    if (mask) {
+      handle_.set_affinity_mask(mask);
+      REXLOG_INFO("Thread '{}' placed on CPU mask 0x{:X}", name, mask);
+    }
+  }
+#endif
 
   int priority() override { return handle_.priority(); }
   void set_priority(int new_priority) override { handle_.set_priority(new_priority); }
@@ -1437,6 +1518,23 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
 #if !REX_PLATFORM_ANDROID
   if (pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, nullptr) != 0) {
     assert_always();
+  }
+#endif
+#if REX_PLATFORM_LINUX
+  // Timers fire as asked: the default slack (50 us or more, larger on Android) let each of the
+  // game's thousands of short sleeps and timed waits per second take ~2.6x their time.
+  prctl(PR_SET_TIMERSLACK, 1UL, 0, 0, 0);
+#endif
+#if REX_PLATFORM_ANDROID
+  // Linux threads inherit their creator's CPU affinity: every thread the prime-core "Game Master"
+  // starts would be stuck on that one core with it (the trace showed Game Master waiting for its
+  // own core 71% of the time). Start on all cores; set_name then places the thread by its name.
+  {
+    cpu_set_t all_cpus;
+    CPU_ZERO(&all_cpus);
+    const int cpu_count = int(sysconf(_SC_NPROCESSORS_CONF));
+    for (int cpu = 0; cpu < cpu_count && cpu < CPU_SETSIZE; ++cpu) CPU_SET(cpu, &all_cpus);
+    sched_setaffinity(0, sizeof(all_cpus), &all_cpus);
   }
 #endif
   set_current_thread_name("");

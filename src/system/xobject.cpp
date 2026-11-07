@@ -11,6 +11,14 @@
 
 #include <vector>
 
+#include <map>
+#ifndef _WIN32
+#include <pthread.h>
+#endif
+#include <chrono>
+#include <mutex>
+#include <string>
+#include <rex/cvar.h>
 #include <rex/chrono/clock.h>
 #include <rex/stream.h>
 #include <rex/system/kernel_state.h>
@@ -26,6 +34,46 @@
 #include <rex/system/xsemaphore.h>
 #include <rex/system/xsymboliclink.h>
 #include <rex/system/xthread.h>
+
+
+REXCVAR_DEFINE_BOOL(guest_wait_stats, false, "Kernel",
+                    "Log guest waits and sleeps per thread every 2 seconds");
+
+namespace rex::system {
+// Guest waits per thread (guest_wait_stats): how often, how long asked and taken, how many timed
+// out. Finds frame pacing done with timed waits or sleeps that take longer on the host.
+void RecordGuestWait(const char* kind, int64_t requested_ms, uint64_t taken_ns, bool timed_out) {
+  if (!REXCVAR_GET(guest_wait_stats)) return;
+  struct Entry {
+    uint64_t count = 0, timeouts = 0, taken_ns = 0;
+    int64_t requested_ms = 0;
+  };
+  static std::mutex mutex;
+  static std::map<std::string, Entry> entries;
+  static auto last_log = std::chrono::steady_clock::now();
+  char thread_name[32] = {};
+#ifndef _WIN32
+  pthread_getname_np(pthread_self(), thread_name, sizeof(thread_name));
+#endif
+  std::string key = std::string(kind) + " " + thread_name;
+  std::lock_guard<std::mutex> lock(mutex);
+  Entry& e = entries[key];
+  ++e.count;
+  e.taken_ns += taken_ns;
+  if (requested_ms >= 0 && requested_ms < 100000) e.requested_ms += requested_ms;
+  if (timed_out) ++e.timeouts;
+  const auto now = std::chrono::steady_clock::now();
+  const double seconds = std::chrono::duration<double>(now - last_log).count();
+  if (seconds < 2.0) return;
+  for (const auto& [name, v] : entries) {
+    REXSYS_INFO("Wait stats: {} - {:.0f}/s, taken {:.1f} ms/s, asked {:.1f} ms/s, {:.0f} timeouts/s",
+                name, v.count / seconds, v.taken_ns / 1e6 / seconds, v.requested_ms / seconds,
+                v.timeouts / seconds);
+  }
+  entries.clear();
+  last_log = now;
+}
+}  // namespace rex::system
 
 namespace rex::system {
 
@@ -213,7 +261,13 @@ X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t a
                                 : std::chrono::milliseconds::max();
 
   XThread::CheckTitleTermination();
+  const auto wait_start = std::chrono::steady_clock::now();
   auto result = rex::thread::Wait(wait_handle, alertable ? true : false, timeout_ms);
+  RecordGuestWait("Wait", opt_timeout ? int64_t(timeout_ms.count()) : -1,
+                  uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now() - wait_start)
+                               .count()),
+                  result == rex::thread::WaitResult::kTimeout);
   XThread::CheckTitleTermination();
   switch (result) {
     case rex::thread::WaitResult::kSuccess:
@@ -274,8 +328,14 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
 
   XThread::CheckTitleTermination();
   if (wait_type) {
+    const auto wait_start = std::chrono::steady_clock::now();
     auto result =
         rex::thread::WaitAny(std::move(wait_handles), alertable ? true : false, timeout_ms);
+    RecordGuestWait("WaitAny", opt_timeout ? int64_t(timeout_ms.count()) : -1,
+                    uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now() - wait_start)
+                                 .count()),
+                    result.first == rex::thread::WaitResult::kTimeout);
     XThread::CheckTitleTermination();
     switch (result.first) {
       case rex::thread::WaitResult::kSuccess:
@@ -295,8 +355,14 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
         return X_STATUS_UNSUCCESSFUL;
     }
   } else {
+    const auto wait_start = std::chrono::steady_clock::now();
     auto result =
         rex::thread::WaitAll(std::move(wait_handles), alertable ? true : false, timeout_ms);
+    RecordGuestWait("WaitAll", opt_timeout ? int64_t(timeout_ms.count()) : -1,
+                    uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now() - wait_start)
+                                 .count()),
+                    result == rex::thread::WaitResult::kTimeout);
     XThread::CheckTitleTermination();
     switch (result) {
       case rex::thread::WaitResult::kSuccess:

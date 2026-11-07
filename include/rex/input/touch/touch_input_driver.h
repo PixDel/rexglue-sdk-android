@@ -51,6 +51,7 @@ class TouchInputDriver final : public InputDriver,
   rex::ui::Window* attached_window_ = nullptr;
   uint32_t packet_number_ = 0;
   uint16_t last_logged_buttons_ = 0;
+  uint64_t last_signature_ = 0;
 };
 
 // Draws the touch controls over the picture (an ImGui dialog that stays open for the whole run).

@@ -11,7 +11,10 @@
 
 #pragma once
 
+#include <chrono>
+#include <cstdint>
 #include <mutex>
+#include <thread>
 
 namespace rex::thread {
 
@@ -57,6 +60,38 @@ class global_critical_region {
  public:
   static std::recursive_mutex& mutex();
 
+  // Guest "interrupts off" (recompiled mtmsrd / spinlock sequences). The sections are a handful
+  // of instructions, so a contended lock spins briefly before it sleeps in the kernel: on Android
+  // every futex sleep and wake costs far more than the section itself, and the game's main thread
+  // spent over a third of its time blocked here.
+  static void EnterGuest() {
+    auto& m = mutex();
+    for (int i = 0; i < 2000; ++i) {
+      if (m.try_lock()) {
+        ++guest_depth_;
+        return;
+      }
+      CpuRelax();
+    }
+    m.lock();
+    ++guest_depth_;
+  }
+  static void LeaveGuest() {
+    --guest_depth_;
+    mutex().unlock();
+  }
+  // Whether this thread is inside a guest critical section (the guest's mfmsr EE bit). Only the
+  // owning thread can be inside, so no lock is needed to answer.
+  static bool GuestHeldByThisThread() { return guest_depth_ != 0; }
+  static inline void CpuRelax() {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    __asm__ __volatile__("yield");
+#elif defined(__x86_64__) || defined(_M_X64)
+    __builtin_ia32_pause();
+#endif
+  }
+  static inline thread_local int guest_depth_ = 0;
+
   // Acquires a lock on the global critical section.
   // Use this when keeping an instance is not possible. Otherwise, prefer
   // to keep an instance of global_critical_region near the members requiring
@@ -81,5 +116,24 @@ class global_critical_region {
     return std::unique_lock<std::recursive_mutex>(mutex(), std::try_to_lock);
   }
 };
+
+// A guest spin-wait iteration (recompiled cctpl). The first iterations of a wait only hint the
+// CPU, so short waits stay instant; a thread that keeps spinning sleeps 50 us per iteration
+// instead of burning a core (on phones that heat throttles every core). A wait counts as over
+// when the thread hasn't paused for 200 us.
+inline void GuestSpinPause() {
+  using clock = std::chrono::steady_clock;
+  static thread_local clock::time_point last;
+  static thread_local uint32_t run = 0;
+  const auto now = clock::now();
+  if (now - last > std::chrono::microseconds(200)) run = 0;
+  last = now;
+  if (++run <= 64) {
+    for (int i = 0; i < 8; ++i) global_critical_region::CpuRelax();
+    return;
+  }
+  std::this_thread::sleep_for(std::chrono::microseconds(50));
+  last = clock::now();
+}
 
 }  // namespace rex::thread

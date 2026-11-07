@@ -405,9 +405,8 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
   // gated eager font upload in SetImmediateDrawer is skipped (font uploads
   // lazily on the first Draw instead).
   imgui_drawer_->SetPresenterAndImmediateDrawer(presenter, drawer);
-  if (rex::input::touch::TouchControlsSupported()) {
-    touch_controls_ = std::make_unique<rex::input::touch::TouchControlsDialog>(imgui_drawer_.get());
-  }
+  // Android draws the touch controls with a native View over the game (TouchOverlayView): an
+  // always-open ImGui dialog would make every guest frame wait for a UI-thread paint.
   rex::ui::RegisterBind("bind_debug_overlay", "F3", "Toggle debug overlay", [this] {
     if (debug_overlay_) {
       debug_overlay_.reset();

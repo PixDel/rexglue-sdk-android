@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <algorithm>
 #include <limits>
 #include <mutex>
@@ -42,6 +43,20 @@ uint64_t last_host_tick_count_ = Clock::QueryHostTickCount();
 // Mutex to ensure last_host_tick_count_ and last_guest_tick_count_ are in sync
 std::mutex tick_mutex_;
 
+// Guest time = guest + (host now - host) * num / den, from the last ratio change.
+struct ClockAnchor {
+  uint64_t host;
+  uint64_t guest;
+  uint64_t num;
+  uint64_t den;
+  uint64_t GuestAt(uint64_t host_now) const {
+    const uint64_t delta = host_now > host ? host_now - host : 0;
+    // delta * num / den without a 128-bit product (no __udivti3 on Windows/MSVC runtimes).
+    return guest + (delta / den) * num + (delta % den) * num / den;
+  }
+};
+std::atomic<const ClockAnchor*> clock_anchor_{nullptr};
+
 void RecomputeGuestTickScalar() {
   // Create a rational number with numerator (first) and denominator (second)
   auto frac = std::make_pair(guest_tick_frequency_, Clock::QueryHostTickFrequency());
@@ -58,7 +73,17 @@ void RecomputeGuestTickScalar() {
   reduce_fraction(frac);
 
   std::lock_guard<std::mutex> lock(tick_mutex_);
+  // Re-anchor at the current guest time so it stays continuous across the ratio change.
+  const uint64_t host_now = Clock::QueryHostTickCount();
+  uint64_t guest_now = last_guest_tick_count_;
+  if (const ClockAnchor* old_anchor = clock_anchor_.load(std::memory_order_acquire)) {
+    guest_now = old_anchor->GuestAt(host_now);
+  }
   guest_tick_ratio_ = frac;
+  // Old anchors are not freed: readers may still hold them, and the ratio changes only a few
+  // times per run.
+  clock_anchor_.store(new ClockAnchor{host_now, guest_now, frac.first, frac.second},
+                      std::memory_order_release);
 }
 
 // Update the guest timer for all threads.
@@ -69,6 +94,14 @@ uint64_t UpdateGuestClock() {
   if (REXCVAR_GET(clock_no_scaling)) {
     // Nothing to update, calculate on the fly
     return host_tick_count * guest_tick_ratio_.first / guest_tick_ratio_.second;
+  }
+
+  // Lock-free: guest ticks are a function of host time from the last anchor. Every thread's
+  // mftb landed here (spinning game threads poll it constantly), and the old per-call delta
+  // conversion both serialized them on tick_mutex_ and dropped the remainder of each division,
+  // so the guest clock ran slow when polled more often than once per guest tick.
+  if (const ClockAnchor* anchor = clock_anchor_.load(std::memory_order_acquire)) {
+    return anchor->GuestAt(host_tick_count);
   }
 
   std::unique_lock<std::mutex> lock(tick_mutex_, std::defer_lock);

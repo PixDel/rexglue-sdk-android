@@ -28,6 +28,10 @@
 #include <rex/logging.h>
 #include <rex/math.h>
 
+REXCVAR_DEFINE_INT32(skip_msaa_transfers, 0, "GPU",
+                     "Workaround for drivers that read 4x multisampled images as 0 (Qualcomm "
+                     "Adreno): skip EDRAM copies between sample counts. 0 = off, 1 = depth out of "
+                     "4x, 2 = everything out of 4x, 3 = everything into or out of 4x");
 REXCVAR_DEFINE_BOOL(mrt_edram_used_range_clamp_to_min, true, "GPU",
                     "Clamp MRT EDRAM used range to minimum");
 
@@ -1621,8 +1625,20 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
                     !transfer_host_depth_source.IsEmpty()
                         ? render_targets_.find(transfer_host_depth_source)
                         : render_targets_.end();
-                if (transfer_host_depth_source.IsEmpty() ||
-                    transfer_host_depth_source_rt_it != render_targets_.end()) {
+                // Debug (Qualcomm Adreno): its driver reads 4x multisampled depth as 0, so
+                // copying depth from a multisampled target into one with another sample count
+                // wipes the destination's depth.
+                const int32_t skip_mode = REXCVAR_GET(skip_msaa_transfers);
+                const bool source_4x = transfer_source.msaa_samples >= xenos::MsaaSamples::k4X;
+                const bool dest_4x = dest.msaa_samples >= xenos::MsaaSamples::k4X;
+                const bool skip_msaa_depth =
+                    (skip_mode == 1 && dest.is_depth && transfer_source.is_depth && source_4x &&
+                     transfer_source.msaa_samples != dest.msaa_samples) ||
+                    (skip_mode == 2 && source_4x && transfer_source.msaa_samples != dest.msaa_samples) ||
+                    (skip_mode >= 3 && (source_4x || dest_4x) &&
+                     transfer_source.msaa_samples != dest.msaa_samples);
+                if (!skip_msaa_depth && (transfer_host_depth_source.IsEmpty() ||
+                    transfer_host_depth_source_rt_it != render_targets_.end())) {
                   assert_false(transfer_host_depth_source_rt_it != render_targets_.end() &&
                                !transfer_host_depth_source_rt_it->second);
                   transfers_append_out->emplace_back(

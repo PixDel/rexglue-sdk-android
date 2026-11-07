@@ -50,6 +50,10 @@ function(rexglue_apply_target_settings target_name)
         if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
             target_link_options(${target_name} PRIVATE -Wl,--no-relax)
             target_compile_options(${target_name} PRIVATE -mcmodel=large)
+        elseif(ANDROID)
+            # ARMv8.2 (every Snapdragon since the 845, 2018): LSE atomics inline instead of the
+            # outline helpers armv8-a needs (they showed up in profiles), plus fp16 and rcpc.
+            target_compile_options(${target_name} PRIVATE -march=armv8.2-a)
         elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64")
             target_compile_options(${target_name} PRIVATE -march=armv8-a)
         endif()

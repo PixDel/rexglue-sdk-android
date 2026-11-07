@@ -26,6 +26,9 @@
 #endif
 
 REXCVAR_DEFINE_BOOL(vulkan_log_debug_messages, true, "UI/Vulkan", "Log Vulkan debug messages");
+REXCVAR_DEFINE_BOOL(vulkan_renderdoc_layer, false, "UI/Vulkan",
+                    "Enable the RenderDoc capture layer if the app ships it (debug builds)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 #if REX_HAS_ADRENOTOOLS
 #include <dlfcn.h>
@@ -290,6 +293,12 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
   bool layer_khronos_validation = false;
   if (try_enable_validation) {
     requested_layers.emplace("VK_LAYER_KHRONOS_validation", &layer_khronos_validation);
+  }
+  // A RenderDoc layer packaged with a debuggable app (Android: libVkLayer_GLES_RenderDoc.so in the
+  // APK's native libraries), for frame captures without changing the device's settings.
+  bool layer_renderdoc = false;
+  if (REXCVAR_GET(vulkan_renderdoc_layer)) {
+    requested_layers.emplace("VK_LAYER_RENDERDOC_Capture", &layer_renderdoc);
   }
 
   std::vector<const char*> enabled_layers;

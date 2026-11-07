@@ -126,9 +126,20 @@ int WINAPI wWinMain(HINSTANCE hinstance, HINSTANCE hinstance_prev, LPWSTR comman
 
 #elif defined(__ANDROID__)
 
+#include <SDL3/SDL_hints.h>
+#include <SDL3/SDL_system.h>
+#include <unistd.h>
+
 // Android: SDLActivity loads libmain.so and calls SDL_main (SDLActivity.getMainFunction) on its
 // own thread, with the arguments from SDLActivity.getArguments.
 extern "C" __attribute__((visibility("default"))) int SDL_main(int argc, char* argv[]) {
+  // The process starts in "/", which an app cannot write: relative paths (logs/, the default
+  // "rom" game folder) go to the app's own external folder instead.
+  if (const char* dir = SDL_GetAndroidExternalStoragePath()) {
+    chdir(dir);
+  }
+  // Touches arrive as touch events (the touch controls, ImGui); no extra mouse clicks from them.
+  SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");
   return RunWindowedApp(argc, argv);
 }
 

@@ -18,6 +18,7 @@
 #include <rex/input/input_driver.h>
 #include <rex/input/input_system.h>
 #include <rex/input/mnk/mnk_input_driver.h>
+#include <rex/input/touch/touch_input_driver.h>
 #include <rex/input/nop/nop_input_driver.h>
 #include <rex/input/sdl/sdl_input_driver.h>
 #include <rex/input/state_merge.h>
@@ -339,6 +340,12 @@ std::unique_ptr<InputSystem> CreateDefaultInputSystem(bool tool_mode) {
       if (sdl_driver->Setup() == X_STATUS_SUCCESS) {
         input->AddDriver(std::move(sdl_driver));
       }
+    }
+
+    // On-screen touch controls (Android): a virtual controller for player 1.
+    auto touch_driver = std::make_unique<touch::TouchInputDriver>(nullptr, 0);
+    if (touch_driver->Setup() == X_STATUS_SUCCESS) {
+      input->AddDriver(std::move(touch_driver));
     }
 
     // MnK driver (keyboard/mouse -> controller emulation)

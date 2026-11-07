@@ -9,6 +9,7 @@
  *              See LICENSE file in the project root for full license text.
  */
 
+#include <rex/input/touch/touch_input_driver.h>
 #include <rex/rex_app.h>
 
 #include <cstdlib>
@@ -168,7 +169,12 @@ bool ReXApp::SetupEnvironment() {
                                         log_level_str, category_levels);
   if (log_file_cvar.empty()) {
     log_config.app_name = std::string(GetName());
+#if REX_PLATFORM_ANDROID
+    // The "executable" folder is the app's read-only native library folder.
+    log_config.log_dir = (user_data_root_ / "logs").string();
+#else
     log_config.log_dir = (exe_dir / "logs").string();
+#endif
   }
 
   rex::InitLogging(log_config);
@@ -399,6 +405,9 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
   // gated eager font upload in SetImmediateDrawer is skipped (font uploads
   // lazily on the first Draw instead).
   imgui_drawer_->SetPresenterAndImmediateDrawer(presenter, drawer);
+  if (rex::input::touch::TouchControlsSupported()) {
+    touch_controls_ = std::make_unique<rex::input::touch::TouchControlsDialog>(imgui_drawer_.get());
+  }
   rex::ui::RegisterBind("bind_debug_overlay", "F3", "Toggle debug overlay", [this] {
     if (debug_overlay_) {
       debug_overlay_.reset();
@@ -586,6 +595,7 @@ void ReXApp::OnDestroy() {
   achievement_notification_.reset();
   achievements_overlay_.reset();
   settings_overlay_.reset();
+  touch_controls_.reset();
   console_overlay_.reset();
   debug_overlay_.reset();
   if (imgui_drawer_) {

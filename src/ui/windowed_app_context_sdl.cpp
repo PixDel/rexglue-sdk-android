@@ -182,6 +182,15 @@ void SDLWindowedAppContext::ProcessEvent(SDL_Event& event) {
       }
       break;
     }
+    case SDL_EVENT_FINGER_DOWN:
+    case SDL_EVENT_FINGER_UP:
+    case SDL_EVENT_FINGER_MOTION:
+    case SDL_EVENT_FINGER_CANCELED: {
+      if (WindowSDL* window = GetWindow(event.tfinger.windowID)) {
+        window->HandleTouchEvent(event);
+      }
+      break;
+    }
     case SDL_EVENT_MOUSE_WHEEL: {
       if (WindowSDL* window = GetWindow(event.wheel.windowID)) {
         window->HandleMouseEvent(event);

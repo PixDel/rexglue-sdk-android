@@ -40,6 +40,7 @@ class WindowSDL final : public Window {
   void HandleKeyEvent(SDL_Event& event);
   void HandleTextInputEvent(SDL_Event& event);
   void HandleMouseEvent(SDL_Event& event);
+  void HandleTouchEvent(SDL_Event& event);
   void HandleDropEvent(SDL_Event& event);
   void HandlePaintEvent();
 

@@ -13,8 +13,12 @@
 #include <chrono>
 #include <array>
 #include <cstdint>
+#include <atomic>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <iterator>
+#include <thread>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -29,6 +33,7 @@
 #include <rex/dbg.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/thread.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/shader_constant_overrides.h>
@@ -71,8 +76,102 @@ REXCVAR_DEFINE_BOOL(vulkan_async_skip_incomplete_frames, true, "GPU/Vulkan",
 REXCVAR_DEFINE_INT32(vulkan_fence_poll_min_age, REX_PLATFORM_ANDROID ? 2 : 0, "GPU/Vulkan",
                      "Poll only fences of submissions at least this many submissions old (drivers "
                      "that block in vkGetFenceStatus for work in flight, e.g. Mesa Turnip)");
+REXCVAR_DEFINE_BOOL(vulkan_fence_thread, REX_PLATFORM_ANDROID ? true : false, "GPU/Vulkan",
+                    "Wait for submission fences on a separate thread, the GPU thread only reads "
+                    "how far it got (drivers that block in fence status queries, e.g. Mesa Turnip)");
 REXCVAR_DEFINE_BOOL(vulkan_submission_stats, false, "GPU/Vulkan",
                     "Log queue submissions and fence waits per second");
+
+namespace {
+// vulkan_fence_thread: waits for each submission's fence in order and publishes the last completed
+// submission. Mesa Turnip blocks in vkGetFenceStatus until the GPU is done with the fence, which
+// took the GPU thread up to half of every second. Fences reach the watcher after vkQueueSubmit and
+// the command processor reclaims (and later resets) a fence only once the watcher has passed it.
+struct FenceWatcher {
+  std::mutex mutex;
+  std::condition_variable work_cv, done_cv;
+  std::deque<std::pair<uint64_t, VkFence>> queue;
+  std::atomic<uint64_t> completed{0};
+  std::atomic<bool> lost{false};
+  bool stop = false;
+  std::thread thread;
+  const rex::ui::vulkan::VulkanDevice::Functions* dfn = nullptr;
+  VkDevice device = VK_NULL_HANDLE;
+
+  void Push(const rex::ui::vulkan::VulkanDevice::Functions& functions, VkDevice dev,
+            uint64_t submission, VkFence fence) {
+    std::lock_guard lock(mutex);
+    if (!thread.joinable()) {
+      dfn = &functions;
+      device = dev;
+      stop = false;
+      thread = std::thread([this] { Run(); });
+    }
+    queue.emplace_back(submission, fence);
+    work_cv.notify_one();
+  }
+
+  void Run() {
+    rex::thread::set_current_thread_name("GPU Fences");
+    while (true) {
+      std::pair<uint64_t, VkFence> item;
+      {
+        std::unique_lock lock(mutex);
+        work_cv.wait(lock, [this] { return stop || !queue.empty(); });
+        if (queue.empty()) return;  // stopping
+        item = queue.front();
+      }
+      VkResult result;
+      do {
+        result = dfn->vkWaitForFences(device, 1, &item.second, VK_TRUE, 100000000);  // 100 ms
+      } while (result == VK_TIMEOUT && !stop);
+      {
+        std::lock_guard lock(mutex);
+        if (result == VK_SUCCESS) {
+          queue.pop_front();
+          completed.store(item.first, std::memory_order_release);
+        } else if (result != VK_TIMEOUT) {
+          lost.store(true, std::memory_order_release);
+          queue.clear();
+        }
+        done_cv.notify_all();
+        if (stop && result != VK_SUCCESS) return;
+      }
+      if (result != VK_SUCCESS && result != VK_TIMEOUT) {
+        std::unique_lock lock(mutex);
+        work_cv.wait(lock, [this] { return stop; });
+        return;
+      }
+    }
+  }
+
+  // Blocks until the submission has completed or the device is lost.
+  void Await(uint64_t submission) {
+    std::unique_lock lock(mutex);
+    done_cv.wait(lock, [&] {
+      return completed.load(std::memory_order_acquire) >= submission ||
+             lost.load(std::memory_order_acquire);
+    });
+  }
+
+  // Ends the thread and forgets everything (on context shutdown, after all work is done).
+  void Reset() {
+    {
+      std::lock_guard lock(mutex);
+      stop = true;
+      work_cv.notify_all();
+    }
+    if (thread.joinable()) thread.join();
+    std::lock_guard lock(mutex);
+    queue.clear();
+    completed.store(0);
+    lost.store(false);
+    stop = false;
+  }
+};
+FenceWatcher g_fence_watcher;
+bool g_fence_watcher_used = false;  // decided per context, so a hot change can't strand fences
+}  // namespace
 REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, true, "GPU/Vulkan",
                     "Submit command buffer when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -788,6 +887,7 @@ bool VulkanCommandProcessor::SetupContext() {
     return false;
   }
   InvalidateAllVertexBufferResidency();
+  g_fence_watcher_used = REXCVAR_GET(vulkan_fence_thread);
 
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -2110,6 +2210,7 @@ void VulkanCommandProcessor::ShutdownContext() {
     dfn.vkDestroySemaphore(device, semaphore.second, nullptr);
   }
   submissions_in_flight_semaphores_.clear();
+  g_fence_watcher.Reset();
   for (VkFence& fence : submissions_in_flight_fences_) {
     dfn.vkDestroyFence(device, fence, nullptr);
   }
@@ -5014,6 +5115,7 @@ void MaybeLogSubmissionStats() {
 namespace {
 // GPU time per submission (vulkan_submission_stats): a timestamp at the start and the end of each
 // command buffer, read once its fence has signaled.
+
 constexpr uint32_t kGpuTimerSlots = 256;
 VkQueryPool g_gpu_timer_pool = VK_NULL_HANDLE;
 double g_gpu_timer_period_ns = 1.0;
@@ -5048,9 +5150,15 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
     // synchronization scope all commands that occur earlier in submission
     // order."
     const auto wait_start = std::chrono::steady_clock::now();
-    VkResult wait_result =
-        dfn.vkWaitForFences(device, uint32_t(await_submission - submission_completed_),
-                            submissions_in_flight_fences_.data(), VK_TRUE, UINT64_MAX);
+    VkResult wait_result;
+    if (g_fence_watcher_used) {
+      g_fence_watcher.Await(await_submission);
+      wait_result = g_fence_watcher.lost.load() ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
+    } else {
+      wait_result =
+          dfn.vkWaitForFences(device, uint32_t(await_submission - submission_completed_),
+                              submissions_in_flight_fences_.data(), VK_TRUE, UINT64_MAX);
+    }
     ++g_submission_stats.waits;
     g_submission_stats.wait_ns += StatNs(wait_start);
     if (wait_result == VK_SUCCESS) {
@@ -5072,7 +5180,18 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
   // the frames in flight.
   const uint64_t last_submitted = GetCurrentSubmission() - 1;
   const uint64_t min_age = uint64_t(std::max(0, REXCVAR_GET(vulkan_fence_poll_min_age)));
-  while (fences_awaited < fences_total) {
+  if (g_fence_watcher_used) {
+    // No Vulkan call: the watcher thread has waited for the fences up to `completed`.
+    const uint64_t watcher_completed = g_fence_watcher.completed.load(std::memory_order_acquire);
+    if (watcher_completed > submission_completed_ + fences_awaited) {
+      fences_awaited = size_t(std::min<uint64_t>(watcher_completed - submission_completed_,
+                                                 fences_total));
+    }
+    if (g_fence_watcher.lost.load(std::memory_order_acquire)) {
+      device_lost_ = true;
+    }
+  }
+  while (!g_fence_watcher_used && fences_awaited < fences_total) {
     const uint64_t fence_submission = submission_completed_ + 1 + fences_awaited;
     if (fence_submission + min_age > last_submitted) {
       break;
@@ -5575,6 +5694,9 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     // Increments the current submission number, going to the next submission.
     submissions_in_flight_fences_.push_back(fence);
     fences_free_.pop_back();
+    if (g_fence_watcher_used) {
+      g_fence_watcher.Push(dfn, device, submission_current, fence);
+    }
 
     submission_open_ = false;
   }

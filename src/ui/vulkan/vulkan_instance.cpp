@@ -29,6 +29,7 @@ REXCVAR_DEFINE_BOOL(vulkan_log_debug_messages, true, "UI/Vulkan", "Log Vulkan de
 
 #if REX_HAS_ADRENOTOOLS
 #include <dlfcn.h>
+#include <stdlib.h>
 
 #include <filesystem>
 
@@ -40,6 +41,10 @@ REXCVAR_DEFINE_BOOL(vulkan_log_debug_messages, true, "UI/Vulkan", "Log Vulkan de
 REXCVAR_DEFINE_STRING(vulkan_driver, "", "UI/Vulkan",
                       "Android: a custom Vulkan driver to use instead of the system one, as the "
                       "path to its libvulkan_*.so (e.g. Mesa Turnip); empty = the system driver")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(vulkan_driver_debug, "", "UI/Vulkan",
+                      "Android: TU_DEBUG flags for a Mesa Turnip vulkan_driver (e.g. 'sysmem' to "
+                      "render without tiling); empty = the driver's defaults")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace {
@@ -63,6 +68,10 @@ bool LoadCustomAndroidVulkanDriver(rex::platform::DynamicLibrary& loader) {
   if (ec) {
     REXLOG_ERROR("vulkan_driver: cannot copy {}: {}; using the system driver", source, ec.message());
     return false;
+  }
+  if (const std::string debug = REXCVAR_GET(vulkan_driver_debug); !debug.empty()) {
+    setenv("TU_DEBUG", debug.c_str(), 1);
+    REXLOG_INFO("vulkan_driver: TU_DEBUG={}", debug);
   }
   const std::string hook_dir = rex::filesystem::GetExecutableFolder().string() + "/";
   const std::string driver_dir = dir.string() + "/";

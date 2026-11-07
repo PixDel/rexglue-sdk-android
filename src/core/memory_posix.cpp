@@ -54,7 +54,8 @@
 #include <linux/ashmem.h>
 
 // TODO(tomc): Android or maybe na. idk
-// #include "xenia/base/main_android.h"
+#include <android/sharedmem.h>
+#include <rex/main_android.h>
 #endif
 
 namespace rex {
@@ -88,7 +89,9 @@ static std::string MakeShmName(const std::filesystem::path& path) {
 // May be null if no dynamically loaded functions are required.
 static void* libandroid_;
 // API 26+.
-static int (*android_ASharedMemory_create_)(const char* name, size_t size);
+// Set from the start: nothing calls AndroidInitialize, and /dev/ashmem (the fallback) is closed to
+// apps targeting API 29+. The build's minimum API level is 29, so the function always exists.
+static int (*android_ASharedMemory_create_)(const char* name, size_t size) = ASharedMemory_create;
 
 void AndroidInitialize() {
   if (rex::GetAndroidApiLevel() >= 26) {

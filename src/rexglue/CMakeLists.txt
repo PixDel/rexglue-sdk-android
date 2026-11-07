@@ -41,4 +41,11 @@ if(WIN32)
     endif()
 endif()
 
-add_executable(rex::rexglue ALIAS rexglue)
+if(CMAKE_CROSSCOMPILING AND REXGLUE_HOST_TOOL)
+    # Cross builds (Android): the codegen step must run the build machine's rexglue, not the one
+    # built for the target. REXGLUE_HOST_TOOL points at it (e.g. the Windows build's rexglue.exe).
+    add_executable(rex::rexglue IMPORTED GLOBAL)
+    set_target_properties(rex::rexglue PROPERTIES IMPORTED_LOCATION "${REXGLUE_HOST_TOOL}")
+else()
+    add_executable(rex::rexglue ALIAS rexglue)
+endif()

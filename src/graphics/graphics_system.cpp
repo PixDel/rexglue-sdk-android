@@ -41,7 +41,7 @@ REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
 
 REXCVAR_DECLARE(int32_t, frame_rate_limit);
 
-REXCVAR_DECLARE(double, guest_vblank_rate);  // d3d12_presenter.cpp
+REXCVAR_DECLARE(double, guest_vblank_rate);  // presenter.cpp
 
 namespace {
 

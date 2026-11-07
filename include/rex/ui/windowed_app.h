@@ -24,9 +24,10 @@
 #include <rex/platform.h>
 #include <rex/ui/windowed_app_context.h>
 
-#if REX_PLATFORM_ANDROID
-// Multiple apps in a single library instead of separate executables.
-#define XE_UI_WINDOWED_APPS_IN_LIBRARY 1
+// Xenia's Android port put several apps in one library (its own NativeActivity). Here SDL's
+// SDLActivity runs one app per libmain.so, as an executable does elsewhere.
+#ifndef XE_UI_WINDOWED_APPS_IN_LIBRARY
+#define XE_UI_WINDOWED_APPS_IN_LIBRARY 0
 #endif
 
 namespace rex {

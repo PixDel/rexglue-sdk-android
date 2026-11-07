@@ -19,6 +19,9 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#if defined(__ANDROID__)
+#include <dlfcn.h>
+#endif
 
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
@@ -91,6 +94,15 @@ std::filesystem::path GetExecutablePath() {
   std::error_code ec;
   std::filesystem::path canonical_path = std::filesystem::weakly_canonical(executable_path, ec);
   return ec ? std::filesystem::path(executable_path) : canonical_path;
+#elif defined(__ANDROID__)
+  // /proc/self/exe is the zygote's app_process64. The "executable" is the app's native library
+  // holding this code, in the app's native library folder next to the GPU plugin and the other
+  // libraries (the APK extracts them: extractNativeLibs / useLegacyPackaging).
+  Dl_info info{};
+  if (!dladdr(reinterpret_cast<void*>(&GetExecutablePath), &info) || !info.dli_fname) {
+    return {};
+  }
+  return std::filesystem::path(info.dli_fname);
 #else
   char buff[FILENAME_MAX] = "";
   readlink("/proc/self/exe", buff, FILENAME_MAX);
@@ -98,6 +110,18 @@ std::filesystem::path GetExecutablePath() {
   return s;
 #endif
 }
+
+#if defined(__ANDROID__)
+// Android content:// URIs (Storage Access Framework) would need a JNI call to ContentResolver;
+// nothing opens them yet (the game data is a plain folder), so this reports failure.
+int OpenAndroidContentFileDescriptor(const std::string_view uri, const char* mode) {
+  (void)uri;
+  (void)mode;
+  return -1;
+}
+void AndroidInitialize() {}
+void AndroidShutdown() {}
+#endif
 
 std::filesystem::path GetExecutableFolder() {
   return GetExecutablePath().parent_path();

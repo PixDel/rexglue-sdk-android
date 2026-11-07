@@ -100,6 +100,9 @@ target_include_directories(rexcore PRIVATE
 
 if(APPLE)
     target_link_libraries(rexcore PRIVATE pthread)
+elseif(ANDROID)
+    # pthread and rt are part of bionic's libc; libandroid for ASharedMemory (memory_posix.cpp).
+    target_link_libraries(rexcore PRIVATE dl android log)
 elseif(UNIX)
     target_link_libraries(rexcore PRIVATE pthread rt dl)
 endif()

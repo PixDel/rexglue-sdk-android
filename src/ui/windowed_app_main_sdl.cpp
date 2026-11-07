@@ -124,6 +124,14 @@ int WINAPI wWinMain(HINSTANCE hinstance, HINSTANCE hinstance_prev, LPWSTR comman
   return RunWindowedApp(static_cast<int>(argv_ptrs.size()), argv_ptrs.data());
 }
 
+#elif defined(__ANDROID__)
+
+// Android: SDLActivity loads libmain.so and calls SDL_main (SDLActivity.getMainFunction) on its
+// own thread, with the arguments from SDLActivity.getArguments.
+extern "C" __attribute__((visibility("default"))) int SDL_main(int argc, char* argv[]) {
+  return RunWindowedApp(argc, argv);
+}
+
 #else
 
 int main(int argc, char* argv[]) {

@@ -32,6 +32,11 @@ class DynamicLibrary {
 
   bool Load(const std::filesystem::path& path, SymbolResolution mode = SymbolResolution::kLazy);
   void Close();
+  // Takes over a handle opened elsewhere (e.g. by libadrenotools); Close() releases it.
+  void Adopt(void* handle) {
+    Close();
+    handle_ = handle;
+  }
   explicit operator bool() const { return handle_ != nullptr; }
 
   void* GetRawSymbol(const char* name) const;

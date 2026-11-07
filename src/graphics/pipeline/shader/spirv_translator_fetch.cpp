@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <rex/cvar.h>
 #include <climits>
 #include <cmath>
 #include <memory>
@@ -21,6 +22,11 @@
 #include <rex/assert.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/math.h>
+
+REXCVAR_DEFINE_BOOL(spirv_texture_fetch_explicit_lod, false, "GPU/Vulkan",
+                    "Debug: sample textures at the explicit LOD (mip 0 + bias) instead of from "
+                    "derivatives")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::graphics {
 
@@ -576,8 +582,14 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
     // kTextureFetch, kGetTextureComputedLod or kGetTextureWeights.
 
     // Whether to use gradients (implicit or explicit) for LOD calculation.
+    // spirv_texture_fetch_explicit_lod (debug): ordinary fetches take the explicit LOD (the
+    // fetch's bias, usually mip 0) instead of gradients, for drivers that get the derivatives
+    // inside the translated shader's control flow wrong.
     bool use_computed_lod = instr.attributes.use_computed_lod &&
-                            (is_pixel_shader() || instr.attributes.use_register_gradients);
+                            (is_pixel_shader() || instr.attributes.use_register_gradients) &&
+                            !(REXCVAR_GET(spirv_texture_fetch_explicit_lod) &&
+                              instr.opcode == ucode::FetchOpcode::kTextureFetch &&
+                              !instr.attributes.use_register_gradients);
     if (instr.opcode == ucode::FetchOpcode::kGetTextureComputedLod &&
         (!use_computed_lod || instr.attributes.use_register_gradients)) {
       assert_always();

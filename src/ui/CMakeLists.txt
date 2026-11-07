@@ -152,6 +152,15 @@ endif()
 if(ANDROID)
     # Android: the window and Vulkan surface come from SDL3 / ANativeWindow; no X11 or Wayland.
     target_link_libraries(rexui PUBLIC android log)
+    # libadrenotools: load a custom Vulkan driver (Mesa Turnip) instead of the system one
+    # (vulkan_driver). Its hook libraries must end up in the APK's native library folder.
+    if(NOT TARGET adrenotools)
+        add_subdirectory(${REXGLUE_ROOT}/thirdparty/libadrenotools
+                         ${CMAKE_BINARY_DIR}/libadrenotools EXCLUDE_FROM_ALL)
+    endif()
+    target_link_libraries(rexui PRIVATE adrenotools)
+    add_dependencies(rexui main_hook file_redirect_hook gsl_alloc_hook hook_impl)
+    target_compile_definitions(rexui PRIVATE REX_HAS_ADRENOTOOLS=1)
 elseif(UNIX AND NOT APPLE)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(X11_XCB REQUIRED x11-xcb)

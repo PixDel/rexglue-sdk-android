@@ -22,6 +22,11 @@
 #include <rex/string.h>
 #include <rex/ui/vulkan/device.h>
 
+REXCVAR_DEFINE_BOOL(vulkan_emulate_adreno_alignments, false, "UI/Vulkan",
+                    "Debug: use Adreno's 64-byte buffer offset alignments on any device");
+REXCVAR_DEFINE_INT32(vulkan_max_storage_buffer_range_mb, 0, "UI/Vulkan",
+                     "Debug: treat the device's maxStorageBufferRange as at most this many MB "
+                     "(0 = the device's own; 128 behaves like Qualcomm Adreno)");
 REXCVAR_DEFINE_BOOL(vulkan_require_fragment_stores_and_atomics, true, "UI/Vulkan",
                     "Deprecated and ignored for parity; fragmentStoresAndAtomics is always "
                     "required for Vulkan GPU emulation")
@@ -595,6 +600,12 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   XE_UI_VULKAN_LIMIT(maxImageDimensionCube)
   XE_UI_VULKAN_LIMIT(maxImageArrayLayers)
   XE_UI_VULKAN_LIMIT(maxStorageBufferRange)
+  if (const int32_t limit_mb = REXCVAR_GET(vulkan_max_storage_buffer_range_mb); limit_mb > 0 &&
+      uint64_t(limit_mb) * 1024 * 1024 < device->properties_.maxStorageBufferRange) {
+    device->properties_.maxStorageBufferRange = uint32_t(limit_mb) * 1024 * 1024;
+    REXLOG_WARN("* maxStorageBufferRange limited to {} MB (vulkan_max_storage_buffer_range_mb)",
+                limit_mb);
+  }
   XE_UI_VULKAN_LIMIT(maxSamplerAllocationCount)
   XE_UI_VULKAN_LIMIT(maxPerStageDescriptorSamplers)
   XE_UI_VULKAN_LIMIT(maxPerStageDescriptorStorageBuffers)
@@ -625,6 +636,17 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   XE_UI_VULKAN_LIMIT(optimalBufferCopyOffsetAlignment)
   XE_UI_VULKAN_LIMIT(optimalBufferCopyRowPitchAlignment)
   XE_UI_VULKAN_LIMIT(nonCoherentAtomSize)
+  if (REXCVAR_GET(vulkan_emulate_adreno_alignments)) {
+    // Debug: the alignments a Qualcomm Adreno 7xx reports, to reproduce its behavior elsewhere.
+    auto raise = [](auto& value, uint32_t at_least) {
+      if (value < at_least) value = at_least;
+    };
+    raise(device->properties_.minUniformBufferOffsetAlignment, 64);
+    raise(device->properties_.minStorageBufferOffsetAlignment, 64);
+    raise(device->properties_.optimalBufferCopyOffsetAlignment, 64);
+    raise(device->properties_.optimalBufferCopyRowPitchAlignment, 64);
+    REXLOG_WARN("* buffer alignments raised to 64 (vulkan_emulate_adreno_alignments)");
+  }
 
   if (with_gpu_emulation) {
     XE_UI_VULKAN_FEATURE(robustBufferAccess)

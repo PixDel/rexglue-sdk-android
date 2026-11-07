@@ -27,6 +27,60 @@
 
 REXCVAR_DEFINE_BOOL(vulkan_log_debug_messages, true, "UI/Vulkan", "Log Vulkan debug messages");
 
+#if REX_HAS_ADRENOTOOLS
+#include <dlfcn.h>
+
+#include <filesystem>
+
+#include <SDL3/SDL_system.h>
+#include <adrenotools/driver.h>
+
+#include <rex/filesystem.h>
+
+REXCVAR_DEFINE_STRING(vulkan_driver, "", "UI/Vulkan",
+                      "Android: a custom Vulkan driver to use instead of the system one, as the "
+                      "path to its libvulkan_*.so (e.g. Mesa Turnip); empty = the system driver")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+namespace {
+// Loads the driver named by vulkan_driver through libadrenotools. The .so is copied to the app's
+// internal storage first: Android refuses to load code from shared storage. Returns false (and
+// the system driver is used) if it is not set or cannot be loaded.
+bool LoadCustomAndroidVulkanDriver(rex::platform::DynamicLibrary& loader) {
+  namespace fs = std::filesystem;
+  const std::string source = REXCVAR_GET(vulkan_driver);
+  if (source.empty()) return false;
+  const char* internal = SDL_GetAndroidInternalStoragePath();
+  if (!internal) {
+    REXLOG_ERROR("vulkan_driver: no internal storage path; using the system driver");
+    return false;
+  }
+  std::error_code ec;
+  const fs::path dir = fs::path(internal) / "gpu_driver";
+  fs::create_directories(dir, ec);
+  const fs::path name = fs::path(source).filename();
+  fs::copy_file(source, dir / name, fs::copy_options::overwrite_existing, ec);
+  if (ec) {
+    REXLOG_ERROR("vulkan_driver: cannot copy {}: {}; using the system driver", source, ec.message());
+    return false;
+  }
+  const std::string hook_dir = rex::filesystem::GetExecutableFolder().string() + "/";
+  const std::string driver_dir = dir.string() + "/";
+  void* handle = adrenotools_open_libvulkan(RTLD_NOW, ADRENOTOOLS_DRIVER_CUSTOM, nullptr,
+                                            hook_dir.c_str(), driver_dir.c_str(),
+                                            name.string().c_str(), nullptr, nullptr);
+  if (!handle) {
+    REXLOG_ERROR("vulkan_driver: libadrenotools could not load {}; using the system driver",
+                 name.string());
+    return false;
+  }
+  loader.Adopt(handle);
+  REXLOG_INFO("vulkan_driver: loaded {} through libadrenotools", name.string());
+  return true;
+}
+}  // namespace
+#endif
+
 namespace rex {
 namespace ui {
 namespace vulkan {
@@ -75,7 +129,12 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
     return nullptr;
   }
 #else
-  loader_loaded = vulkan_instance->loader_.Load(platform::lib_names::kVulkanLoader);
+#if REX_HAS_ADRENOTOOLS
+  loader_loaded = LoadCustomAndroidVulkanDriver(vulkan_instance->loader_);
+#endif
+  if (!loader_loaded) {
+    loader_loaded = vulkan_instance->loader_.Load(platform::lib_names::kVulkanLoader);
+  }
   if (!loader_loaded) {
     REXLOG_ERROR("Failed to load {}", platform::lib_names::kVulkanLoader);
     return nullptr;

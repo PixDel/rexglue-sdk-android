@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -67,6 +68,11 @@ REXCVAR_DEFINE_BOOL(vulkan_async_skip_incomplete_frames, true, "GPU/Vulkan",
                     "used placeholder pipelines to avoid visible flashing")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_INT32(vulkan_fence_poll_min_age, REX_PLATFORM_ANDROID ? 2 : 0, "GPU/Vulkan",
+                     "Poll only fences of submissions at least this many submissions old (drivers "
+                     "that block in vkGetFenceStatus for work in flight, e.g. Mesa Turnip)");
+REXCVAR_DEFINE_BOOL(vulkan_submission_stats, false, "GPU/Vulkan",
+                    "Log queue submissions and fence waits per second");
 REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, true, "GPU/Vulkan",
                     "Submit command buffer when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -4974,6 +4980,34 @@ void VulkanCommandProcessor::WriteGuestOcclusionResult(uint32_t sample_count_add
   sample_counts->StencilFail_B = 0;
 }
 
+namespace {
+// Submission statistics (vulkan_submission_stats): logged every 2 seconds.
+struct SubmissionStats {
+  uint64_t submits = 0, submit_ns = 0, waits = 0, wait_ns = 0, polls = 0, poll_ns = 0;
+  std::chrono::steady_clock::time_point last_log = std::chrono::steady_clock::now();
+};
+SubmissionStats g_submission_stats;
+inline uint64_t StatNs(std::chrono::steady_clock::time_point start) {
+  return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now() - start)
+                      .count());
+}
+void MaybeLogSubmissionStats() {
+  if (!REXCVAR_GET(vulkan_submission_stats)) return;
+  auto& st = g_submission_stats;
+  const auto now = std::chrono::steady_clock::now();
+  const double seconds = std::chrono::duration<double>(now - st.last_log).count();
+  if (seconds < 2.0) return;
+  REXGPU_INFO(
+      "Submission stats per second: {:.0f} submits ({:.2f} ms), {:.0f} blocking fence waits "
+      "({:.2f} ms), {:.0f} fence polls ({:.2f} ms)",
+      st.submits / seconds, st.submit_ns / 1e6 / seconds, st.waits / seconds,
+      st.wait_ns / 1e6 / seconds, st.polls / seconds, st.poll_ns / 1e6 / seconds);
+  st = SubmissionStats();
+  st.last_log = now;
+}
+}  // namespace
+
 void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_submission) {
   // Only report once, no need to retry a wait that won't succeed anyway.
   if (device_lost_) {
@@ -5001,9 +5035,12 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
     // defined by vkQueueSubmit additionally include in the first
     // synchronization scope all commands that occur earlier in submission
     // order."
+    const auto wait_start = std::chrono::steady_clock::now();
     VkResult wait_result =
         dfn.vkWaitForFences(device, uint32_t(await_submission - submission_completed_),
                             submissions_in_flight_fences_.data(), VK_TRUE, UINT64_MAX);
+    ++g_submission_stats.waits;
+    g_submission_stats.wait_ns += StatNs(wait_start);
     if (wait_result == VK_SUCCESS) {
       fences_awaited += await_submission - submission_completed_;
     } else {
@@ -5016,9 +5053,25 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
   // Check how far into the submissions the GPU currently is, in order because
   // submission themselves can be executed out of order, but Xenia serializes
   // that for simplicity.
+  // Only fences of submissions at least vulkan_fence_poll_min_age old are polled: Mesa Turnip on
+  // Adreno doesn't return at once for a fence still in flight (vkGetFenceStatus and zero-timeout
+  // waits both block until the GPU is done, ~27 ms a frame), which made every submission wait for
+  // the previous frame. Polling only reclaims resources early; the blocking wait above still caps
+  // the frames in flight.
+  const uint64_t last_submitted = GetCurrentSubmission() - 1;
+  const uint64_t min_age = uint64_t(std::max(0, REXCVAR_GET(vulkan_fence_poll_min_age)));
   while (fences_awaited < fences_total) {
+    const uint64_t fence_submission = submission_completed_ + 1 + fences_awaited;
+    if (fence_submission + min_age > last_submitted) {
+      break;
+    }
+    const auto poll_start = std::chrono::steady_clock::now();
+    // vkGetFenceStatus, not vkWaitForFences with a zero timeout: Mesa Turnip on Adreno blocks for
+    // ~27 ms in the latter (a kgsl timestamp wait), which took two thirds of the GPU thread.
     VkResult fence_status =
-        dfn.vkWaitForFences(device, 1, &submissions_in_flight_fences_[fences_awaited], VK_TRUE, 0);
+        dfn.vkGetFenceStatus(device, submissions_in_flight_fences_[fences_awaited]);
+    ++g_submission_stats.polls;
+    g_submission_stats.poll_ns += StatNs(poll_start);
     if (fence_status != VK_SUCCESS) {
       if (fence_status == VK_ERROR_DEVICE_LOST) {
         device_lost_ = true;
@@ -5448,7 +5501,11 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     {
       ui::vulkan::VulkanDevice::Queue::Acquisition queue_acquisition =
           vulkan_device->AcquireQueue(vulkan_device->queue_family_graphics_compute(), 0);
+      const auto submit_start = std::chrono::steady_clock::now();
       submit_result = dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit_info, fence);
+      ++g_submission_stats.submits;
+      g_submission_stats.submit_ns += StatNs(submit_start);
+      MaybeLogSubmissionStats();
     }
     if (submit_result != VK_SUCCESS) {
       REXGPU_ERROR("Failed to submit a Vulkan command buffer");

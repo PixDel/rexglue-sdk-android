@@ -272,6 +272,14 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
         return nullptr;
       }
       assert_true(supported_extension_count == supported_extensions.size());
+      {
+        std::string all;
+        for (const VkExtensionProperties& e : supported_extensions) {
+          all += e.extensionName;
+          all += ' ';
+        }
+        REXLOG_INFO("Vulkan device extensions available: {}", all);
+      }
       for (const VkExtensionProperties& supported_extension : supported_extensions) {
         const auto requested_extension_it =
             requested_extensions.find(supported_extension.extensionName);

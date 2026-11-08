@@ -71,12 +71,12 @@ REXCVAR_DEFINE_INT32(present_safe_area_y, 90, "UI/Presenter",
 // CAS and FSR 1 (EASU + RCAS) are built-in shaders; only the temporal FSR 2/3 need the
 // FidelityFX SDK.
 #if defined(REX_HAS_FIDELITYFX_SDK)
-REXCVAR_DEFINE_STRING(present_effect, REX_PLATFORM_ANDROID ? "fsr" : "bilinear", "UI/Presenter",
+REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter",
                       "Guest output effect: bilinear, cas, fsr, fsr2, fsr3")
     .allowed({"bilinear", "cas", "fsr", "fsr2", "fsr3"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 #else
-REXCVAR_DEFINE_STRING(present_effect, REX_PLATFORM_ANDROID ? "fsr" : "bilinear", "UI/Presenter",
+REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter",
                       "Guest output effect: bilinear, cas, fsr")
     .allowed({"bilinear", "cas", "fsr"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);

@@ -14,6 +14,7 @@
 
 #include <SDL3/SDL_gamepad.h>
 #include <imgui.h>
+#include <imgui_internal.h>
 
 #include <rex/cvar.h>
 #include <rex/input/input.h>
@@ -24,8 +25,8 @@
 
 REXCVAR_DEFINE_STRING(touch_controls, "auto", "Input",
                       "On-screen touch controls: 'auto' (while no game controller is connected), "
-                      "'on' or 'off'")
-    .allowed({"auto", "on", "off"});
+                      "'on', 'menu' (only the menu and portal buttons) or 'off'")
+    .allowed({"auto", "on", "menu", "off"});
 REXCVAR_DEFINE_DOUBLE(touch_controls_opacity, 0.45, "Input",
                       "Opacity of the on-screen touch controls (0.1 - 1)")
     .range(0.1, 1.0);
@@ -125,18 +126,53 @@ bool GamepadConnected() {
   return connected.load(std::memory_order_relaxed);
 }
 
+// When a menu last said it was shown (NoteMenuShown), in steady-clock milliseconds.
+std::atomic<int64_t> g_menu_shown_ms{0};
+
+int64_t NowMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch())
+      .count();
+}
+
+// A menu is open: shown within the last few frames (the game's UI runs at 30 FPS or more).
+bool MenuOpen() { return NowMs() - g_menu_shown_ms.load(std::memory_order_relaxed) < 200; }
+
 // Whether the controls take touches and are drawn (the eye button aside).
 bool ControlsVisible(const State& s) {
   const std::string mode = REXCVAR_GET(touch_controls);
-  if (mode == "off" || s.hidden_by_user) return false;
-  return mode == "on" || !GamepadConnected();
+  if (mode == "off" || s.hidden_by_user || MenuOpen()) return false;
+  return mode == "on" || mode == "menu" || !GamepadConnected();
+}
+
+// Only the menu and portal buttons (touch_controls = menu): the rest is played with a controller.
+bool MenuButtonsOnly() { return REXCVAR_GET(touch_controls) == "menu"; }
+
+// Whether a control is offered in the current mode.
+bool ControlOffered(int control) {
+  return !MenuButtonsOnly() || control == kSettings || control == kPortal;
+}
+
+// Whether a touch at this window pixel lands on an open ImGui window that takes input (a menu):
+// then the free stick area leaves it to the menu. The buttons still work there.
+bool OverMenuWindow(const State& s, float x, float y) {
+  ImGuiContext* g = ImGui::GetCurrentContext();
+  if (!g || s.width <= 0 || s.height <= 0) return false;
+  const ImVec2 p(x * g->IO.DisplaySize.x / s.width, y * g->IO.DisplaySize.y / s.height);
+  for (ImGuiWindow* w : g->Windows) {
+    if (!w->WasActive || w->Hidden || (w->Flags & ImGuiWindowFlags_ChildWindow) ||
+        (w->Flags & ImGuiWindowFlags_NoMouseInputs)) {
+      continue;
+    }
+    if (w->Rect().Contains(p)) return true;
+  }
+  return false;
 }
 
 // Whether the eye button is there at all.
 bool EyeVisible() {
   const std::string mode = REXCVAR_GET(touch_controls);
   if (mode == "off") return false;
-  return mode == "on" || !GamepadConnected();
+  return mode == "on" || mode == "menu" || !GamepadConnected();
 }
 
 void UpdateLayout(State& s, float w, float h) {
@@ -221,6 +257,15 @@ bool ControlHeld(const State& s, int control) {
 
 bool TouchControlsSupported() {
   return REX_PLATFORM_ANDROID != 0;
+}
+
+void NoteMenuShown() { g_menu_shown_ms.store(NowMs(), std::memory_order_relaxed); }
+
+void PressButtons(const std::string& chord) {
+  if (!TouchControlsSupported()) return;
+  State& s = Shared();
+  std::lock_guard lock(s.mutex);
+  Pulse(s, chord);
 }
 
 TouchInputDriver::TouchInputDriver(rex::ui::Window* window, size_t window_z_order)
@@ -369,12 +414,13 @@ void TouchInputDriver::OnTouchEvent(rex::ui::TouchEvent& e) {
     if (!ControlsVisible(s)) return;
     int control = kNone;
     for (int c = 0; c < kControlCount; ++c) {
-      if (c != kEye && s.layout[c].Hit(x, y)) {
+      if (c != kEye && ControlOffered(c) && s.layout[c].Hit(x, y)) {
         control = c;
         break;
       }
     }
-    if (control == kNone && !s.stick_active && x < s.width * 0.5f && y > s.height * 0.3f) {
+    if (control == kNone && !MenuButtonsOnly() && !s.stick_active && x < s.width * 0.5f &&
+        y > s.height * 0.3f && !OverMenuWindow(s, x, y)) {
       control = kStick;
       s.stick_active = true;
       s.stick_base_x = s.stick_x = x;
@@ -516,11 +562,14 @@ extern "C" JNIEXPORT jint JNICALL Java_de_pixdel_ssarecomp_TouchOverlayView_nati
   float buf[8 + 3 * kControlCount] = {};
   {
     std::lock_guard lock(s.mutex);
+    // Again each poll: touch_controls_scale changes in the settings menu apply at once.
+    if (s.width > 0) UpdateLayout(s, s.width, s.height);
     uint32_t flags = 0;
     if (s.width > 0 && EyeVisible()) flags |= 1;
     if (s.width > 0 && ControlsVisible(s)) flags |= 2;
     if (s.hidden_by_user) flags |= 4;
     if (s.stick_active) flags |= 8;
+    if (MenuButtonsOnly()) flags |= 16;
     uint32_t held = 0;
     for (int c = 0; c < kControlCount; ++c) {
       if (ControlHeld(s, c)) held |= 1u << c;

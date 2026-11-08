@@ -590,15 +590,20 @@ void ImGuiDrawer::OnTouchEvent(TouchEvent& e) {
       return;
     }
   }
-  UpdateMousePosition(e.x(), e.y());
+  // Through ImGui's input queue, not io.MouseDown: a quick tap (down and up before the next UI
+  // frame, common at the game's 30 FPS) set and cleared MouseDown within one frame, so no menu
+  // ever saw the click. The queue spreads the press and the release over frames.
+  const float physical_to_logical = float(window_->GetMediumDpi()) / float(window_->GetDpi());
+  io.AddMouseSourceEvent(ImGuiMouseSource_TouchScreen);
+  io.AddMousePosEvent(e.x() * physical_to_logical, e.y() * physical_to_logical);
   if (action == TouchEvent::Action::kUp || action == TouchEvent::Action::kCancel) {
-    io.MouseDown[0] = false;
+    io.AddMouseButtonEvent(0, false);
     touch_pointer_id_ = TouchEvent::kPointerIDNone;
-    // Make sure that after a touch, the ImGui mouse isn't hovering over
-    // anything.
-    reset_mouse_position_after_next_frame_ = true;
+    // After a touch the ImGui mouse hovers over nothing (queued, so after the release).
+    io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+    reset_mouse_position_after_next_frame_ = false;
   } else {
-    io.MouseDown[0] = true;
+    if (action == TouchEvent::Action::kDown) io.AddMouseButtonEvent(0, true);
     reset_mouse_position_after_next_frame_ = false;
   }
 }

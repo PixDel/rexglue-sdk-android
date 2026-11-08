@@ -49,15 +49,48 @@ REXCVAR_DEFINE_STRING(vulkan_driver_debug, "", "UI/Vulkan",
                       "Android: TU_DEBUG flags for a Mesa Turnip vulkan_driver (e.g. 'sysmem' to "
                       "render without tiling); empty = the driver's defaults")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+// The player's choice (a settings menu entry) among the drivers the app offers: the one that
+// comes with it (vulkan_driver_bundled), one the player imported (vulkan_driver_custom), or the
+// system's. The app passes the two paths at start; vulkan_driver, if set, overrides all three.
+REXCVAR_DEFINE_STRING(vulkan_driver_choice, "bundled", "UI/Vulkan",
+                      "Android: which Vulkan driver to use when vulkan_driver is empty: bundled "
+                      "(the app's), custom (imported by the player) or system")
+    .allowed({"bundled", "custom", "system"})
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(vulkan_driver_bundled, "", "UI/Vulkan",
+                      "Android: path of the driver that comes with the app (set by the app)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(vulkan_driver_custom, "", "UI/Vulkan",
+                      "Android: path of a driver the player imported (set by the app)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace {
-// Loads the driver named by vulkan_driver through libadrenotools. The .so is copied to the app's
-// internal storage first: Android refuses to load code from shared storage. Returns false (and
-// the system driver is used) if it is not set or cannot be loaded.
+// The driver to load: vulkan_driver, else the one vulkan_driver_choice picks (an imported driver
+// that is missing falls back to the bundled one). Empty = the system driver.
+std::string ChosenAndroidVulkanDriver() {
+  std::string source = REXCVAR_GET(vulkan_driver);
+  if (!source.empty()) return source;
+  const std::string choice = REXCVAR_GET(vulkan_driver_choice);
+  if (choice == "system") return {};
+  if (choice == "custom") {
+    source = REXCVAR_GET(vulkan_driver_custom);
+    std::error_code ec;
+    if (!source.empty() && std::filesystem::is_regular_file(source, ec)) return source;
+    REXLOG_WARN("vulkan_driver_choice: no imported driver; using the bundled one");
+  }
+  return REXCVAR_GET(vulkan_driver_bundled);
+}
+
+// Loads the chosen driver through libadrenotools. The .so is copied to the app's internal storage
+// first: Android refuses to load code from shared storage. Returns false (and the system driver
+// is used) if none is chosen or it cannot be loaded.
 bool LoadCustomAndroidVulkanDriver(rex::platform::DynamicLibrary& loader) {
   namespace fs = std::filesystem;
-  const std::string source = REXCVAR_GET(vulkan_driver);
-  if (source.empty()) return false;
+  const std::string source = ChosenAndroidVulkanDriver();
+  if (source.empty()) {
+    REXLOG_INFO("vulkan_driver: using the system driver");
+    return false;
+  }
   const char* internal = SDL_GetAndroidInternalStoragePath();
   if (!internal) {
     REXLOG_ERROR("vulkan_driver: no internal storage path; using the system driver");

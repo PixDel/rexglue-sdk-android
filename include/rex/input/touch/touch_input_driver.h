@@ -13,6 +13,7 @@
  */
 
 #include <chrono>
+#include <string>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -66,5 +67,13 @@ class TouchControlsDialog final : public rex::ui::ImGuiDialog {
 
 // Whether this platform shows touch controls at all (Android).
 bool TouchControlsSupported();
+
+// A menu drawn this frame (called by the menus each frame they are open): while one is, the
+// on-screen controls step aside (not drawn, no touches taken) so every touch reaches the menu.
+void NoteMenuShown();
+
+// Presses these buttons on the touch controller for a moment ("b", "back+rb", ...), for a menu's
+// own touch targets (its button hints).
+void PressButtons(const std::string& chord);
 
 }  // namespace rex::input::touch

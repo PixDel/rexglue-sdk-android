@@ -96,6 +96,9 @@ struct State {
   float stick_base_x = 0, stick_base_y = 0, stick_x = 0, stick_y = 0, stick_radius = 1;
   bool stick_active = false;
   bool hidden_by_user = false;
+  // touch_controls = auto with a controller connected: a touch shows the menu and portal buttons
+  // until this time (to reach the menu when the controller is gone, e.g. its battery).
+  Clock::time_point revealed_until{};
   // Chord buttons pressed by the shortcut buttons, until this time.
   uint16_t pulse_buttons = 0;
   uint8_t pulse_lt = 0, pulse_rt = 0;
@@ -137,15 +140,22 @@ int64_t NowMs() {
 // A menu is open: shown within the last few frames (the game's UI runs at 30 FPS or more).
 bool MenuOpen() { return NowMs() - g_menu_shown_ms.load(std::memory_order_relaxed) < 200; }
 
+// Shown for a while after a touch, in auto mode with a controller (State::revealed_until).
+bool Revealed(const State& s) { return Clock::now() < s.revealed_until; }
+
 // Whether the controls take touches and are drawn (the eye button aside).
 bool ControlsVisible(const State& s) {
   const std::string mode = REXCVAR_GET(touch_controls);
   if (mode == "off" || s.hidden_by_user || MenuOpen()) return false;
-  return mode == "on" || mode == "menu" || !GamepadConnected();
+  return mode == "on" || mode == "menu" || !GamepadConnected() || Revealed(s);
 }
 
 // Only the menu and portal buttons (touch_controls = menu): the rest is played with a controller.
-bool MenuButtonsOnly() { return REXCVAR_GET(touch_controls) == "menu"; }
+// (also while a touch revealed them next to a controller: only what reaches the menus).
+bool MenuButtonsOnly() {
+  const std::string mode = REXCVAR_GET(touch_controls);
+  return mode == "menu" || (mode == "auto" && GamepadConnected());
+}
 
 // Whether a control is offered in the current mode.
 bool ControlOffered(int control) {
@@ -411,6 +421,16 @@ void TouchInputDriver::OnTouchEvent(rex::ui::TouchEvent& e) {
       e.set_handled(true);
       return;
     }
+    // A controller is connected and the controls are hidden for it: a touch brings the menu and
+    // portal buttons for a few seconds (each touch keeps them).
+    const bool was_revealed = Revealed(s);
+    if (REXCVAR_GET(touch_controls) == "auto" && GamepadConnected() && !MenuOpen()) {
+      s.revealed_until = Clock::now() + std::chrono::seconds(6);
+      if (!was_revealed) {
+        e.set_handled(true);
+        return;
+      }
+    }
     if (!ControlsVisible(s)) return;
     int control = kNone;
     for (int c = 0; c < kControlCount; ++c) {
@@ -565,7 +585,7 @@ extern "C" JNIEXPORT jint JNICALL Java_de_pixdel_ssarecomp_TouchOverlayView_nati
     // Again each poll: touch_controls_scale changes in the settings menu apply at once.
     if (s.width > 0) UpdateLayout(s, s.width, s.height);
     uint32_t flags = 0;
-    if (s.width > 0 && EyeVisible()) flags |= 1;
+    if (s.width > 0 && (EyeVisible() || Revealed(s))) flags |= 1;
     if (s.width > 0 && ControlsVisible(s)) flags |= 2;
     if (s.hidden_by_user) flags |= 4;
     if (s.stick_active) flags |= 8;
@@ -591,5 +611,14 @@ extern "C" JNIEXPORT jint JNICALL Java_de_pixdel_ssarecomp_TouchOverlayView_nati
   const jsize n = std::min<jsize>(env->GetArrayLength(out), jsize(sizeof(buf) / sizeof(buf[0])));
   env->SetFloatArrayRegion(out, 0, n, buf);
   return jint(kControlCount);
+}
+// Android's Back (gesture or key, SSAActivity.onBackPressed): closes an open menu (B), otherwise
+// opens the settings menu, so the game can always be closed without a controller.
+extern "C" JNIEXPORT void JNICALL Java_de_pixdel_ssarecomp_SSAActivity_nativeBackPressed(JNIEnv*,
+                                                                                       jclass) {
+  using namespace rex::input::touch;
+  State& s = Shared();
+  std::lock_guard lock(s.mutex);
+  Pulse(s, MenuOpen() ? std::string("b") : REXCVAR_GET(touch_settings_chord));
 }
 #endif

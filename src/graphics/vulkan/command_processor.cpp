@@ -4669,7 +4669,9 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
     }
 
     VkBuffer scaled_resolve_buffer = texture_cache_->scaled_resolve_buffer();
-    if (scaled_resolve_buffer == VK_NULL_HANDLE || scaled_start > uint64_t(UINT32_MAX)) {
+    // (Bound from scaled_start below, so a resolve beyond 4 GB of the buffer, at 4x and up,
+    // works too.)
+    if (scaled_resolve_buffer == VK_NULL_HANDLE) {
       return true;
     }
 
@@ -4713,10 +4715,17 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
       return true;
     }
 
+    // Only the part of the scaled resolve buffer this resolve covers. The whole buffer is 512 MB
+    // times the scale's area (4.5 GB at 3x), past maxStorageBufferRange (4 GB on most GPUs):
+    // bound whole, the reads at its end (the shadow resolve at 0x19bc0000 sits at 3.9 GB at 3x)
+    // returned zeros, and the game's sun-lit tiles came out empty, so the shadows vanished.
+    const uint64_t binding_alignment =
+        std::max<uint64_t>(vulkan_device->properties().minStorageBufferOffsetAlignment, 4);
+    const uint64_t binding_offset = scaled_start - scaled_start % binding_alignment;
     VkDescriptorBufferInfo buffer_infos[2] = {};
     buffer_infos[0].buffer = scaled_resolve_buffer;
-    buffer_infos[0].offset = 0;
-    buffer_infos[0].range = VK_WHOLE_SIZE;
+    buffer_infos[0].offset = binding_offset;
+    buffer_infos[0].range = scaled_start + scaled_length - binding_offset;
     buffer_infos[1].buffer = resolve_downscale_buffer_;
     buffer_infos[1].offset = 0;
     buffer_infos[1].range = written_length;
@@ -4755,7 +4764,7 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
     constants.scale_y = texture_cache_->draw_resolution_scale_y();
     constants.pixel_size_log2 = pixel_size_log2;
     constants.tile_count = tile_count;
-    constants.source_offset_bytes = uint32_t(scaled_start);
+    constants.source_offset_bytes = uint32_t(scaled_start - binding_offset);
     constants.half_pixel_offset = (REXCVAR_GET(readback_resolve_half_pixel_offset) &&
                                    (constants.scale_x > 1 || constants.scale_y > 1))
                                       ? 1u

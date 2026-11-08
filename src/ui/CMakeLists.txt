@@ -43,6 +43,7 @@ set(REXUI_VULKAN_SOURCES
     vulkan/vulkan_instance.cpp
     vulkan/vulkan_mem_alloc.cpp
     vulkan/vulkan_presenter.cpp
+    vulkan/vulkan_presenter_frame_generation.cpp
     vulkan/vulkan_provider.cpp
     vulkan/vulkan_submission_tracker.cpp
     vulkan/vulkan_upload_buffer_pool.cpp
@@ -125,6 +126,11 @@ if(REXGLUE_FIDELITYFX_SOURCE_DIR AND EXISTS "${REXGLUE_FIDELITYFX_SOURCE_DIR}/sd
         "${REXGLUE_FIDELITYFX_SOURCE_DIR}/ffx-api/include"
     )
     target_compile_definitions(rexui PRIVATE REX_HAS_FIDELITYFX_SDK=1)
+elseif(ANDROID)
+    # CAS and FSR 1 run from the prebuilt shaders in shaders/vulkan_spirv and need no SDK headers
+    # (only the temporal FSR 2/3 do, behind REX_HAS_FIDELITYFX_RUNTIME): the sharpening and
+    # upscaling choices for the tablets' small 3D pictures.
+    target_compile_definitions(rexui PRIVATE REX_HAS_FIDELITYFX_SDK=1)
 endif()
 
 set(REXUI_HAS_FIDELITYFX_RUNTIME OFF)
@@ -159,6 +165,11 @@ if(ANDROID)
                          ${CMAKE_BINARY_DIR}/libadrenotools EXCLUDE_FROM_ALL)
     endif()
     target_link_libraries(rexui PRIVATE adrenotools)
+    # Optional frame generation (lsfg-vk framegen, REXGLUE_LSFG_DIR).
+    include(${REXGLUE_ROOT}/cmake/rexglue_lsfg.cmake)
+    if(TARGET rex_lsfg)
+        target_link_libraries(rexui PRIVATE rex_lsfg)
+    endif()
     add_dependencies(rexui main_hook file_redirect_hook gsl_alloc_hook hook_impl)
     target_compile_definitions(rexui PRIVATE REX_HAS_ADRENOTOOLS=1)
 elseif(UNIX AND NOT APPLE)

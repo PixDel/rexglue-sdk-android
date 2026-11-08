@@ -79,6 +79,10 @@ REXCVAR_DEFINE_INT32(vulkan_fence_poll_min_age, REX_PLATFORM_ANDROID ? 2 : 0, "G
 REXCVAR_DEFINE_BOOL(vulkan_fence_thread, REX_PLATFORM_ANDROID ? true : false, "GPU/Vulkan",
                     "Wait for submission fences on a separate thread, the GPU thread only reads "
                     "how far it got (drivers that block in fence status queries, e.g. Mesa Turnip)");
+REXCVAR_DEFINE_INT32(vulkan_debug_barriers, 0, "GPU/Vulkan",
+                     "Debug: 1 = widen every pipeline barrier to all commands and all memory, "
+                     "2 = also a full barrier at every barrier point even when none is pending")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(vulkan_submission_stats, false, "GPU/Vulkan",
                     "Log queue submissions and fence waits per second");
 
@@ -3187,9 +3191,19 @@ bool VulkanCommandProcessor::PushImageMemoryBarrier(
 bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass) {
   assert_true(submission_open_);
   SplitPendingBarrier();
+  const int32_t debug_barriers = REXCVAR_GET(vulkan_debug_barriers);
+  VkMemoryBarrier debug_memory_barrier = {};
+  debug_memory_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+  debug_memory_barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+  debug_memory_barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
   if (pending_barriers_.empty()) {
-    if (force_end_render_pass) {
+    if (force_end_render_pass || debug_barriers >= 2) {
       EndRenderPass();
+    }
+    if (debug_barriers >= 2) {
+      deferred_command_buffer_.CmdVkPipelineBarrier(
+          VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1,
+          &debug_memory_barrier, 0, nullptr, 0, nullptr);
     }
     return false;
   }
@@ -3201,9 +3215,11 @@ bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass) {
     // if there are no buffer or image memory barriers in the last pipeline
     // barriers, the offsets may be equal to the sizes of the vectors.
     deferred_command_buffer_.CmdVkPipelineBarrier(
-        it->src_stage_mask ? it->src_stage_mask : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-        it->dst_stage_mask ? it->dst_stage_mask : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0,
-        nullptr,
+        debug_barriers ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT
+        : it->src_stage_mask ? it->src_stage_mask : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        debug_barriers ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT
+        : it->dst_stage_mask ? it->dst_stage_mask : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+        0, debug_barriers ? 1u : 0u, debug_barriers ? &debug_memory_barrier : nullptr,
         uint32_t((is_last ? pending_barriers_buffer_memory_barriers_.size()
                           : it_next->buffer_memory_barriers_offset) -
                  it->buffer_memory_barriers_offset),

@@ -153,11 +153,12 @@ class VulkanPresenter final : public Presenter {
   class GuestOutputImage {
    public:
     static std::unique_ptr<GuestOutputImage> Create(const VulkanDevice* const vulkan_device,
-                                                    const uint32_t width, const uint32_t height) {
+                                                    const uint32_t width, const uint32_t height,
+                                                    const VkFormat format = kGuestOutputFormat) {
       assert_not_zero(width);
       assert_not_zero(height);
-      auto image =
-          std::unique_ptr<GuestOutputImage>(new GuestOutputImage(vulkan_device, width, height));
+      auto image = std::unique_ptr<GuestOutputImage>(
+          new GuestOutputImage(vulkan_device, width, height, format));
       if (!image->Initialize()) {
         return nullptr;
       }
@@ -176,8 +177,8 @@ class VulkanPresenter final : public Presenter {
 
    private:
     GuestOutputImage(const VulkanDevice* const vulkan_device, const uint32_t width,
-                     const uint32_t height)
-        : vulkan_device_(vulkan_device) {
+                     const uint32_t height, const VkFormat format)
+        : vulkan_device_(vulkan_device), format_(format) {
       extent_.width = width;
       extent_.height = height;
     }
@@ -185,6 +186,7 @@ class VulkanPresenter final : public Presenter {
     bool Initialize();
 
     const VulkanDevice* vulkan_device_;
+    VkFormat format_;
 
     VkExtent2D extent_;
     VkImage image_ = VK_NULL_HANDLE;
@@ -202,6 +204,8 @@ class VulkanPresenter final : public Presenter {
     // whether the image has previously been written. If an image is active
     // after a refresh, it can be assumed that this is true.
     bool ever_successfully_refreshed = false;
+    // Increases with every successful refresh (a new guest frame), for frame generation.
+    uint64_t refresh_serial = 0;
 
     void SetToNewImage(const std::shared_ptr<GuestOutputImage>& new_image, uint64_t new_version) {
       image = new_image;
@@ -480,6 +484,20 @@ class VulkanPresenter final : public Presenter {
   // DisconnectPaintingFromSurfaceFromUIThreadImpl) by the thread doing it, as
   // well as by presenter initialization and shutdown.
   PaintContext paint_context_;
+
+  // Frame generation (Android, lsfg; vulkan_presenter.cpp): a generated frame shown before each
+  // real one. A pointer with a plain function deleter keeps the class layout the same whether or
+  // not frame generation is built in.
+  struct FrameGeneration;
+  std::unique_ptr<FrameGeneration, void (*)(FrameGeneration*)> frame_generation_{nullptr, nullptr};
+  uint64_t guest_output_refresh_serial_ = 0;
+  bool frame_generation_paint_again_ = false;
+  // Pacing: the real frame goes out half a real-frame interval after the generated one.
+  uint64_t frame_generation_interval_ns_ = 0;   // smoothed time between real frames
+  uint64_t frame_generation_last_real_ns_ = 0;  // when the last new real frame arrived
+  uint64_t present_stats_serial_ = 0;          // guest frame of the current paint (present_stats)
+  std::shared_ptr<GuestOutputImage> FrameGenerationSubstitute(
+      const std::shared_ptr<GuestOutputImage>& real, uint64_t serial);
 
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
   void* temporal_upscaler_context_ = nullptr;

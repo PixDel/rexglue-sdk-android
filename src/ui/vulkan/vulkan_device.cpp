@@ -673,6 +673,17 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     XE_UI_VULKAN_FEATURE(shaderCullDistance)
     XE_UI_VULKAN_FEATURE(sparseBinding)
     XE_UI_VULKAN_FEATURE(sparseResidencyBuffer)
+#if REX_PLATFORM_ANDROID
+    // Frame generation (lsfg, see vulkan_frame_generation.cpp) runs its compute shaders on this
+    // device; they need these. Enabling them changes nothing for the emulator's own shaders.
+    enabled_features.shaderStorageImageExtendedFormats =
+        supported_features.shaderStorageImageExtendedFormats;
+    enabled_features.shaderStorageImageReadWithoutFormat =
+        supported_features.shaderStorageImageReadWithoutFormat;
+    enabled_features.shaderStorageImageWriteWithoutFormat =
+        supported_features.shaderStorageImageWriteWithoutFormat;
+    enabled_features.shaderInt16 = supported_features.shaderInt16;
+#endif
   }
 
   if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
@@ -680,6 +691,14 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       XE_UI_VULKAN_FEATURE_2(features_1_2, samplerMirrorClampToEdge);
       XE_UI_VULKAN_FEATURE_2(features_1_2, uniformBufferStandardLayout);
       XE_UI_VULKAN_FEATURE_2(features_1_2, scalarBlockLayout);
+#if REX_PLATFORM_ANDROID
+      // For frame generation's shaders (see above).
+      features_1_2.enabled.shaderFloat16 = features_1_2.supported.shaderFloat16;
+      features_1_2.enabled.vulkanMemoryModel = features_1_2.supported.vulkanMemoryModel;
+      features_1_2.enabled.vulkanMemoryModelDeviceScope =
+          features_1_2.supported.vulkanMemoryModelDeviceScope;
+      features_1_2.enabled.timelineSemaphore = features_1_2.supported.timelineSemaphore;
+#endif
     }
   } else {
     if (ext_1_2_KHR_sampler_mirror_clamp_to_edge) {

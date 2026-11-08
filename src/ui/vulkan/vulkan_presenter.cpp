@@ -10,12 +10,17 @@
  */
 
 #include <algorithm>
+#if defined(__ANDROID__)
+#include <dlfcn.h>
+#endif
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cmath>
 #include <cstring>
 #include <memory>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -49,6 +54,13 @@
 REXCVAR_DEFINE_BOOL(present_render_pass_clear, true, "UI/Presenter",
                     "Clear render pass during presentation");
 
+REXCVAR_DECLARE(int32_t, frame_generation);
+REXCVAR_DEFINE_BOOL(present_stats, false, "UI/Presenter", "Log presents per second")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);  // vulkan_presenter_frame_generation.cpp
+REXCVAR_DEFINE_INT32(android_display_rate, 60, "UI/Presenter",
+                     "Android: ask the display for this refresh rate (0 = leave it); 60 paces the "
+                     "game's 30 FPS and frame generation evenly")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_immediate, true, "UI/Vulkan",
                     "Allow immediate present mode (no vsync)");
 
@@ -200,6 +212,8 @@ VulkanPresenter::~VulkanPresenter() {
   // and the vkQueuePresentKHR semaphore wait).
   // This will await completion of all paint submissions also.
   paint_context_.DestroySwapchainAndVulkanSurface();
+  // Frame generation's images and its library on this device go before anything else.
+  frame_generation_.reset();
 
   // Await completion of the usage of everything before destroying anything
   // (paint submission completion already awaited).
@@ -807,6 +821,28 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
         surface_create_info.window = android_native_window_surface.window();
         vulkan_surface_create_result = ifn.vkCreateAndroidSurfaceKHR(
             instance, &surface_create_info, nullptr, &paint_context_.vulkan_surface);
+        // A steady display rate the game's frames divide evenly: a 30 FPS game on a 120 or 144 Hz
+        // panel stutters (4.8 refreshes a frame at 144 Hz), and frame generation's pairs only
+        // pace right at 60. ANativeWindow_setFrameRate is Android 11+ (looked up at runtime).
+        if (const int32_t rate = REXCVAR_GET(android_display_rate); rate > 0) {
+          using SetFrameRate = int32_t (*)(ANativeWindow*, float, int8_t);
+          static const auto set_frame_rate = [] {
+            void* symbol = dlsym(RTLD_DEFAULT, "ANativeWindow_setFrameRate");
+            if (!symbol) {
+              if (void* android = dlopen("libandroid.so", RTLD_NOW)) {
+                symbol = dlsym(android, "ANativeWindow_setFrameRate");
+              }
+            }
+            if (!symbol) REXLOG_WARN("VulkanPresenter: ANativeWindow_setFrameRate not found");
+            return reinterpret_cast<SetFrameRate>(symbol);
+          }();
+          if (set_frame_rate) {
+            // ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE = 1
+            const int32_t result =
+                set_frame_rate(android_native_window_surface.window(), float(rate), 1);
+            REXLOG_INFO("VulkanPresenter: display rate {} Hz asked ({})", rate, result);
+          }
+        }
       } break;
 #endif
 #if REX_PLATFORM_GNU_LINUX
@@ -1079,6 +1115,7 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
   bool refresher_succeeded = refresher(context);
   if (refresher_succeeded) {
     image_instance.ever_successfully_refreshed = true;
+    image_instance.refresh_serial = ++guest_output_refresh_serial_;
   }
   // Even if the refresher has returned false, it still might have submitted
   // some commands referencing the image. It's better to put an excessive
@@ -1381,7 +1418,12 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   // interfering with GPU command processing, and also to allow tearing so
   // variable refresh rate may be used where it's available.
   // Note: If the priorities here are changes, update the cvar descriptions.
-  if (REXCVAR_GET(vulkan_allow_present_mode_immediate) &&
+  // Frame generation shows its frame and the real one on consecutive refreshes: that needs FIFO
+  // (mailbox would replace the generated frame before it's ever shown).
+  const bool fifo_only = REXCVAR_GET(frame_generation) >= 2;
+  if (fifo_only) {
+    swapchain_create_info.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+  } else if (REXCVAR_GET(vulkan_allow_present_mode_immediate) &&
       std::find(present_modes.cbegin(), present_modes.cend(), VK_PRESENT_MODE_IMMEDIATE_KHR) !=
           present_modes.cend()) {
     // Allowing tearing to reduce latency, and possibly variable refresh rate
@@ -1480,7 +1522,7 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
   image_create_info.pNext = nullptr;
   image_create_info.flags = 0;
   image_create_info.imageType = VK_IMAGE_TYPE_2D;
-  image_create_info.format = kGuestOutputFormat;
+  image_create_info.format = format_;
   image_create_info.extent.width = extent_.width;
   image_create_info.extent.height = extent_.height;
   image_create_info.extent.depth = 1;
@@ -1488,8 +1530,9 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
   image_create_info.arrayLayers = 1;
   image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
   image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
-  image_create_info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-                            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+  image_create_info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                            VK_IMAGE_USAGE_STORAGE_BIT;
   image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   image_create_info.queueFamilyIndexCount = 0;
   image_create_info.pQueueFamilyIndices = nullptr;
@@ -1510,7 +1553,7 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
   image_view_create_info.flags = 0;
   image_view_create_info.image = image_;
   image_view_create_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
-  image_view_create_info.format = kGuestOutputFormat;
+  image_view_create_info.format = format_;
   image_view_create_info.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
   image_view_create_info.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
   image_view_create_info.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
@@ -1631,6 +1674,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   GuestOutputProperties guest_output_properties;
   GuestOutputPaintConfig guest_output_paint_config;
   std::shared_ptr<GuestOutputImage> guest_output_image;
+  uint64_t guest_output_serial = 0;
   {
     uint32_t guest_output_mailbox_index;
     std::unique_lock<std::mutex> guest_output_consumer_lock(ConsumeGuestOutput(
@@ -1638,11 +1682,17 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     if (guest_output_mailbox_index != UINT32_MAX) {
       assert_true(guest_output_images_[guest_output_mailbox_index].ever_successfully_refreshed);
       guest_output_image = guest_output_images_[guest_output_mailbox_index].image;
+      guest_output_serial = guest_output_images_[guest_output_mailbox_index].refresh_serial;
     }
     // Incremented the reference count of the guest output image - safe to leave
     // the consumer critical section now as everything here either will be using
     // the new reference or is exclusively owned by main target painting (and
     // multiple threads can't paint the main target at the same time).
+  }
+
+  if (guest_output_image) {
+    present_stats_serial_ = guest_output_serial;
+    guest_output_image = FrameGenerationSubstitute(guest_output_image, guest_output_serial);
   }
 
   if (guest_output_image) {
@@ -2237,11 +2287,49 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   present_info.pImageIndices = &swapchain_image_index;
   present_info.pResults = nullptr;
   VkResult present_result;
+  const auto present_start = std::chrono::steady_clock::now();
   {
     const VulkanDevice::Queue::Acquisition queue_acquisition =
         vulkan_device_->AcquireQueue(paint_context_.present_queue_family, 0);
     present_result = dfn.vkQueuePresentKHR(queue_acquisition.queue(), &present_info);
   }
+  if (present_result == VK_SUCCESS || present_result == VK_SUBOPTIMAL_KHR) {
+    // Presents per second (present_stats), e.g. to see frame generation double them.
+    static uint64_t presents = 0, generated = 0, new_frames = 0, last_serial = 0;
+    if (present_stats_serial_ != last_serial) {
+      last_serial = present_stats_serial_;
+      ++new_frames;  // a guest frame not presented before
+    }
+    static auto presents_since = std::chrono::steady_clock::now();
+    ++presents;
+    if (frame_generation_paint_again_) ++generated;  // this present was a generated frame
+    const auto now = std::chrono::steady_clock::now();
+    const double seconds = std::chrono::duration<double>(now - presents_since).count();
+    if (seconds >= 2.0) {
+      if (REXCVAR_GET(present_stats)) {
+        REXLOG_INFO(
+            "VulkanPresenter: {:.1f} presents per second, {:.1f} new guest frames, {:.1f} "
+            "generated",
+            presents / seconds, new_frames / seconds, generated / seconds);
+      }
+      presents = 0;
+      generated = 0;
+      new_frames = 0;
+      presents_since = now;
+    }
+  }
+  if ((present_result == VK_SUCCESS || present_result == VK_SUBOPTIMAL_KHR) &&
+      frame_generation_paint_again_) {
+    // The generated frame went out first; the real one follows half a real-frame interval later,
+    // so both stay on screen about equally long (at 120 Hz, FIFO alone would show the generated
+    // frame for one refresh and the real one for three).
+    const uint64_t half = frame_generation_interval_ns_ / 2;
+    if (half > 2000000 && half < 40000000) {
+      std::this_thread::sleep_until(present_start + std::chrono::nanoseconds(half - 2000000));
+    }
+    return PaintAndPresentImpl(execute_ui_drawers);
+  }
+  frame_generation_paint_again_ = false;
   switch (present_result) {
     case VK_SUCCESS:
       return PaintResult::kPresented;

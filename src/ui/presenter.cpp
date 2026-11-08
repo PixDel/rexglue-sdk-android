@@ -68,11 +68,19 @@ REXCVAR_DEFINE_INT32(present_safe_area_y, 90, "UI/Presenter",
                      "Vertical safe area percentage (0-100)")
     .range(0, 100);
 
+// CAS and FSR 1 (EASU + RCAS) are built-in shaders; only the temporal FSR 2/3 need the
+// FidelityFX SDK.
 #if defined(REX_HAS_FIDELITYFX_SDK)
-REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter",
+REXCVAR_DEFINE_STRING(present_effect, REX_PLATFORM_ANDROID ? "fsr" : "bilinear", "UI/Presenter",
                       "Guest output effect: bilinear, cas, fsr, fsr2, fsr3")
     .allowed({"bilinear", "cas", "fsr", "fsr2", "fsr3"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+#else
+REXCVAR_DEFINE_STRING(present_effect, REX_PLATFORM_ANDROID ? "fsr" : "bilinear", "UI/Presenter",
+                      "Guest output effect: bilinear, cas, fsr")
+    .allowed({"bilinear", "cas", "fsr"})
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+#endif
 
 REXCVAR_DEFINE_DOUBLE(present_cas_additional_sharpness,
                       rex::ui::Presenter::GuestOutputPaintConfig::kCasAdditionalSharpnessDefault,
@@ -94,14 +102,11 @@ REXCVAR_DEFINE_DOUBLE(present_fsr_sharpness_reduction,
            rex::ui::Presenter::GuestOutputPaintConfig::kFsrSharpnessReductionMax)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+#if defined(REX_HAS_FIDELITYFX_SDK)
 REXCVAR_DEFINE_STRING(
     present_fsr_quality_mode, "auto", "UI/Presenter",
     "Temporal FSR quality mode: auto, nativeaa, quality, balanced, performance, ultra_performance")
     .allowed({"auto", "nativeaa", "quality", "balanced", "performance", "ultra_performance"})
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-#else
-REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter", "Guest output effect: bilinear")
-    .allowed({"bilinear"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 #endif
 
@@ -120,13 +125,13 @@ GuestOutputPaintConfig::Effect ParsePresentEffect(const std::string& effect_name
   std::string lowered = effect_name;
   std::transform(lowered.begin(), lowered.end(), lowered.begin(),
                  [](unsigned char c) { return char(std::tolower(c)); });
-#if defined(REX_HAS_FIDELITYFX_SDK)
   if (lowered == "cas") {
     return GuestOutputPaintConfig::Effect::kCas;
   }
   if (lowered == "fsr") {
     return GuestOutputPaintConfig::Effect::kFsr;
   }
+#if defined(REX_HAS_FIDELITYFX_SDK)
   if (lowered == "fsr2") {
     return GuestOutputPaintConfig::Effect::kFsr2;
   }
@@ -289,11 +294,11 @@ GuestOutputPaintConfig BuildGuestOutputPaintConfigFromCVar() {
 #endif
   config.SetAllowOverscanCutoff(REXCVAR_GET(present_allow_overscan_cutoff));
   config.SetEffect(parsed_effect);
-#if defined(REX_HAS_FIDELITYFX_SDK)
   config.SetCasAdditionalSharpness(float(REXCVAR_GET(present_cas_additional_sharpness)));
   config.SetFsrMaxUpsamplingPasses(
       uint32_t(std::max(int32_t(1), REXCVAR_GET(present_fsr_max_upsampling_passes))));
   config.SetFsrSharpnessReduction(float(REXCVAR_GET(present_fsr_sharpness_reduction)));
+#if defined(REX_HAS_FIDELITYFX_SDK)
   config.SetFsrQualityMode(ParsePresentFsrQualityMode(REXCVAR_GET(present_fsr_quality_mode)));
 #endif
   config.SetDither(REXCVAR_GET(present_dither));
